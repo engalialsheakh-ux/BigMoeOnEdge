@@ -42,12 +42,20 @@ int main(int argc, char ** argv) {
     RunInfo r; // defaults: the preamble is not what this test is about
     sink->on_run_info(r);
 
-    RunSummary s;                     // value-init: every other field zero, only the five under test are set
+    RunSummary s;                     // value-init: every other field stays zero
     s.prefill_cpu_seconds = 12.3456;  // %.3f -> 12.346
     s.prefill_read_mib = 4096.5;      // %.1f -> 4096.5
     s.prefill_io_seconds = 3.4567;    // %.3f -> 3.457
     s.prefill_stall_seconds = 2.7182; // %.3f -> 2.718
     s.prefill_mgmt_seconds = 1.4142;  // %.3f -> 1.414
+    s.prefill_cache_hits = 17;
+    s.prefill_cache_lookups = 31;
+    s.prefill_retained_hits = 11;
+    s.prefill_transient_loads = 9;
+    s.prefill_rereads = 4;
+    s.prefill_retained_resident_mib = 123.44;
+    s.prefill_transient_peak_mib = 56.74;
+    s.prefill_cache_peak_mib = 180.14;
     s.prefill_device_tokens = 1536;
     s.prefill_device_nodes = 4321;
     s.prefill_device_read_mib = 18432.04;     // %.1f -> 18432.0
@@ -68,6 +76,14 @@ int main(int argc, char ** argv) {
         expect_key(summary, "prefill_io_s", "3.457");
         expect_key(summary, "prefill_stall_s", "2.718");
         expect_key(summary, "prefill_mgmt_s", "1.414");
+        expect_key(summary, "prefill_cache_hits", "17");
+        expect_key(summary, "prefill_cache_lookups", "31");
+        expect_key(summary, "prefill_retained_hits", "11");
+        expect_key(summary, "prefill_transient_loads", "9");
+        expect_key(summary, "prefill_rereads", "4");
+        expect_key(summary, "prefill_retained_resident_mib", "123.4");
+        expect_key(summary, "prefill_transient_peak_mib", "56.7");
+        expect_key(summary, "prefill_cache_peak_mib", "180.1");
         expect_key(summary, "prefill_dev_tokens", "1536");
         expect_key(summary, "prefill_dev_nodes", "4321");
         expect_key(summary, "prefill_dev_read_mib", "18432.0");

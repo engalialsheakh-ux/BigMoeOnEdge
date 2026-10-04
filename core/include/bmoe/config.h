@@ -40,6 +40,9 @@ enum class DenseWeightsMode {
 struct MoeStreamConfig {
     bool enabled = false; // turn streaming on; init fails fast if the model is not MoE
 
+    // Optional compact trace of exact host-visible expert demands. Empty keeps the hot path inert.
+    std::string access_trace_path;
+
     // LRU expert cache budget, in MiB. 0 disables the cache (experts are re-read from
     // flash every token via three shared slots). Measured pathology: a budget below one
     // token's working set thrashes (evict + re-read, zero hits) and is SLOWER than off,
@@ -79,6 +82,7 @@ struct MoeStreamConfig {
     // immediately, and the remaining projections are committed and appended while the lanes
     // already read. Overlap + LRU cache only. Default off pending the on-device A/B.
     bool io_two_wave = false;
+    bool io_coalesce = false; // merge adjacent demand slices within one projection, max 4 MiB
 
     // Temporal prefetch: while a token computes layer l, speculatively read on the idle I/O
     // lanes the experts the PREVIOUS token routed at layers l+1..l+prefetch_layers, betting on
@@ -481,16 +485,22 @@ struct RunConfig {
     // bmoe/decode_trace.h for what the layer-mode rows contain.
     bool compute_trace_layers = false;
 
-    // Optional CUDA placement. Zero keeps this engine on CPU even in a CUDA-enabled build.
-    // Negative one requests every GPU-eligible layer; streamed routed experts stay on CPU.
+    // Optional CUDA placement and llama.cpp KV cache storage types. Zero GPU layers keeps this
+    // engine on CPU even in a CUDA-enabled build. Negative one requests every GPU-eligible layer;
+    // streamed routed experts stay on CPU.
     struct GpuConfig {
         enum class FlashAttention { Auto, On, Off };
+        enum class KvCacheType { F16, Q8_0, Q4_0 };
         int n_gpu_layers = 0;
         int main_gpu = 0;
         int expert_cache_mb = 0;          // persistent CUDA expert storage; zero disables it
+        int safety_mb = 768;              // dedicated VRAM retained after expert-cache allocation
+        int expert_cache_window = 8;      // prior miss must recur within this many decode tokens
         bool expert_cache_promote = true; // control for all-miss correctness probes
         bool kv_offload = true;
         FlashAttention flash_attn = FlashAttention::Auto;
+        KvCacheType cache_type_k = KvCacheType::F16;
+        KvCacheType cache_type_v = KvCacheType::F16;
     } gpu;
 
     SamplingConfig sampling; // greedy by default (temp <= 0); opt-in stochastic decoding
@@ -499,6 +509,9 @@ struct RunConfig {
     PrefillDeviceConfig prefill; // prefill graphs on an accelerator; off by default
     DecideConfig decide;         // decide()'s prefix-state policy; off by default
 };
+
+// Accepted CLI spellings for llama.cpp KV cache storage types.
+bool parse_kv_cache_type(const std::string & s, RunConfig::GpuConfig::KvCacheType & out);
 
 // Validation result: ok plus a human-readable reason when not.
 struct ValidationResult {

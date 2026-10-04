@@ -1,0 +1,16 @@
+Repository: BigMoeOnEdge, branch main.
+Parent commit before the baseline freeze: 5dac7d724ab98a1e13cae31adf068ba12973fd9c.
+Parent's llama.cpp submodule revision: dce9698510b76746db625b644ef2af899517d0ad.
+Previously staged llama.cpp mixed-graph fork revision: 1647b34c33080ef7c356e3381e315e6f9f2b6af8.
+Frozen llama.cpp revision: 82c26e6a95cf5f57b2ab27bf718bf0dde8fd7611
+  (local branch bmoe/exact-quantized-fa-baseline).
+The CUDA FlashAttention changes were committed locally in that fork branch before
+the parent gitlink was advanced. The fork commit and parent baseline commit were
+not pushed during this freeze. The parent baseline commit is identified by the
+local annotated tag exact-64k-baseline-9.389tps-2026-10-04.
+
+The optimization tree contained tracked and untracked source, tests, analysis
+scripts, and reports before staging. Generated model, trace, benchmark, SDK,
+and build artifacts under ignored build directories were excluded. Local root
+goal-instruction Markdown files were preserved in the worktree but excluded
+from publication.

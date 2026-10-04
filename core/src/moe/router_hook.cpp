@@ -1308,6 +1308,7 @@ void RouterHook::flush_pending() {
             r.expert = P.ids[idx];
             r.weight = have_w ? P.weights[idx] : std::numeric_limits<float>::quiet_NaN();
             r.residency = idx < P.residency.size() ? P.residency[idx] : (uint8_t) 0;
+            r.gpu_hit = idx < P.gpu_hits.size() ? P.gpu_hits[idx] : (uint8_t) 0;
             r.dropped = idx < P.dropped.size() ? P.dropped[idx] : (uint8_t) 0;
             // A dropped routing is never read, so it is neither charged nor allowed to claim the
             // charge for its expert: if another token of the batch routes the same expert and keeps
@@ -1597,7 +1598,11 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
     // one offered (match_weights explains why) and let the flush read it. This runs BEFORE the drop
     // policy edits the same tensor, so the trace records the routing the router produced, not the
     // one the policy left behind — `dropped` is what says which is which.
-    if (is_weights && t->data && t->type == GGML_TYPE_F32 && pending_.layer == wl && pending_.nu > 0)
+    ggml_backend_buffer_t weight_buffer = nullptr;
+    for (const ggml_tensor * src = t; src && !weight_buffer; src = src->view_src)
+        weight_buffer = src->buffer;
+    if (is_weights && t->data && t->type == GGML_TYPE_F32 && pending_.layer == wl && pending_.nu > 0 && weight_buffer &&
+        ggml_backend_buffer_is_host(weight_buffer))
         gather_weights(t, pending_.nu, pending_.nt, pending_.weights);
 
     // Learn which node ends this layer's weight chain, and — once known — use it as the point where
@@ -1702,6 +1707,10 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             pending_.ids = gathered_;
             pending_.weights.clear();
             pending_.dropped.clear();
+            pending_.gpu_hits.assign(gathered_.size(), 0);
+            if (gpu_mapping)
+                for (size_t i = 0; i < gathered_.size(); ++i)
+                    pending_.gpu_hits[i] = gpu_slots_[size_t(gathered_[i])] != 0;
             // Classify against the cache BEFORE load_layer makes these experts resident —
             // afterwards everything reads as a hit. Settle landed prefetches first, or an expert
             // a prefetch correctly guessed would be recorded as a miss.

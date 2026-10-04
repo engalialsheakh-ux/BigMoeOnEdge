@@ -60,6 +60,21 @@ double secs(clock_t_::time_point a, clock_t_::time_point b) {
     return std::chrono::duration<double>(b - a).count();
 }
 
+bool kv_cache_ggml_type(RunConfig::GpuConfig::KvCacheType type, ggml_type & out) {
+    switch (type) {
+    case RunConfig::GpuConfig::KvCacheType::F16:
+        out = GGML_TYPE_F16;
+        return true;
+    case RunConfig::GpuConfig::KvCacheType::Q8_0:
+        out = GGML_TYPE_Q8_0;
+        return true;
+    case RunConfig::GpuConfig::KvCacheType::Q4_0:
+        out = GGML_TYPE_Q4_0;
+        return true;
+    }
+    return false;
+}
+
 // Graph width for the MTP draft context, and it wants to be SMALL.
 //
 // llama.cpp reserves a context's compute buffers for its widest ubatch, and the dominant term is the
@@ -249,18 +264,22 @@ struct Session::Impl {
     bool gpu_graph_attached = false;
     uint64_t gpu_promotions = 0;
     uint64_t gpu_upload_bytes = 0;
+    uint64_t gpu_upload_calls = 0;
     double gpu_upload_ms = 0.0;
     std::vector<uint32_t> gpu_recent_miss;
     uint32_t gpu_decode_sequence = 0;
     struct GpuPromotionJob {
         int layer = -1;
         int expert = -1;
+        int turn = 0;
+        int step = 0;
         size_t total_bytes = 0;
         std::array<std::vector<uint8_t>, MoeRecipe::max_exps> projections;
     };
     std::mutex gpu_job_mtx;
     std::condition_variable gpu_job_cv;
     std::deque<GpuPromotionJob> gpu_jobs;
+    std::vector<GpuCacheTraceEvent> gpu_trace_events;
     std::vector<uint8_t> gpu_queued;
     std::thread gpu_worker;
     std::atomic<bool> gpu_worker_failed{false};
@@ -286,7 +305,10 @@ struct Session::Impl {
                 gpu_jobs.pop_front();
                 gpu_pending_bytes -= job.total_bytes;
             }
+            const uint64_t evictions_before = gpu_experts.evictions();
             auto lease = gpu_experts.reserve(job.layer, job.expert);
+            const bool evicted = gpu_experts.evictions() != evictions_before;
+            bool published = false;
             if (lease) {
                 const auto started = clock_t_::now();
                 bool uploaded = true;
@@ -296,11 +318,13 @@ struct Session::Impl {
                         uploaded = false;
                         break;
                     }
+                    ++gpu_upload_calls;
                 }
                 gpu_upload_ms += secs(started, clock_t_::now()) * 1000.0;
                 if (uploaded && gpu_experts.publish(lease)) {
                     gpu_upload_bytes += job.total_bytes;
                     ++gpu_promotions;
+                    published = true;
                 } else {
                     gpu_experts.abandon(lease);
                     gpu_worker_failed.store(true, std::memory_order_release);
@@ -308,6 +332,9 @@ struct Session::Impl {
             }
             {
                 std::lock_guard<std::mutex> lock(gpu_job_mtx);
+                if (route_trace && published)
+                    gpu_trace_events.push_back(
+                        {job.turn, job.step, job.layer, job.expert, 'P', job.total_bytes, uint8_t(evicted)});
                 gpu_queued[size_t(job.layer) * size_t(gpu_experts.expert_count()) + size_t(job.expert)] = 0;
             }
         }
@@ -329,7 +356,7 @@ struct Session::Impl {
                                       want ? gpu_expert_layers.size() : 0);
         gpu_graph_attached = want;
     }
-    bool promote_gpu_misses() {
+    bool promote_gpu_misses(int step) {
         if (!gpu_experts.buffer() || !hook || !cfg.gpu.expert_cache_promote) return true;
         if (gpu_worker_failed.load(std::memory_order_acquire)) return false;
         if (hook->gpu_misses().empty()) return true;
@@ -343,17 +370,20 @@ struct Session::Impl {
             gpu_recent_miss[recent_index] = gpu_decode_sequence;
             // Repeated routing within a short window is evidence of reuse. The
             // one-hit admission policy churned over 20 slots per token at 2 GiB.
-            if (prior == 0 || gpu_decode_sequence - prior > 8) continue;
+            if (prior == 0 || gpu_decode_sequence - prior > uint32_t(cfg.gpu.expert_cache_window)) continue;
             const void * bytes[MoeRecipe::max_exps]{};
             size_t sizes[MoeRecipe::max_exps]{};
             if (!source.resident_bundle(layer, expert, bytes, sizes)) continue;
             GpuPromotionJob job;
             job.layer = layer;
             job.expert = expert;
+            job.turn = turn;
+            job.step = step;
             for (int p = 0; p < MoeRecipe::max_exps; ++p)
                 job.total_bytes += sizes[p];
             {
                 std::lock_guard<std::mutex> lock(gpu_job_mtx);
+                if (route_trace) gpu_trace_events.push_back({turn, step, layer, expert, 'C', job.total_bytes, 0});
                 if (gpu_queued[recent_index] || job.total_bytes > gpu_staging_limit - gpu_pending_bytes) continue;
             }
             for (int p = 0; p < MoeRecipe::max_exps; ++p) {
@@ -366,6 +396,8 @@ struct Session::Impl {
                 gpu_pending_bytes += job.total_bytes;
                 gpu_queued[recent_index] = 1;
                 gpu_jobs.push_back(std::move(job));
+                if (route_trace)
+                    gpu_trace_events.push_back({turn, step, layer, expert, 'Q', gpu_jobs.back().total_bytes, 0});
             }
             gpu_job_cv.notify_one();
             promoted[size_t(layer)] = 1;
@@ -377,14 +409,18 @@ struct Session::Impl {
         if (hook) hook->begin_gpu_decode();
         const int result = llama_decode(c, b);
         if (hook) hook->finish_gpu_decode();
-        return result == 0 && !promote_gpu_misses() ? -1 : result;
+        return result == 0 && !promote_gpu_misses(b.pos ? b.pos[b.n_tokens - 1] : int(gpu_decode_sequence + 1))
+                   ? -1
+                   : result;
     }
     int decode_placed(llama_context * c, const llama_batch & b) {
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
         const int result = prefill ? prefill->decode(c, b) : llama_decode(c, b);
         if (hook) hook->finish_gpu_decode();
-        return result == 0 && !promote_gpu_misses() ? -1 : result;
+        return result == 0 && !promote_gpu_misses(b.pos ? b.pos[b.n_tokens - 1] : int(gpu_decode_sequence + 1))
+                   ? -1
+                   : result;
     }
     // Every exit from a prefill (errors and cancellation included) leaves the weights on the host:
     // the next graph may be a decode, and the CPU cannot read a device buffer.
@@ -495,13 +531,17 @@ struct Session::Impl {
 
     ~Impl() {
         stop_gpu_worker();
+        if (route_trace && !gpu_trace_events.empty())
+            route_trace->on_gpu_events(gpu_trace_events.data(), gpu_trace_events.size());
         if (gpu_experts.buffer() && hook)
             std::fprintf(stderr,
                          "bmoe-gpu-cache: gpu_expert_hits=%llu cpu_expert_misses=%llu gpu_promotions=%llu "
-                         "gpu_evictions=%llu gpu_cache_resident=%zu gpu_upload_mib=%.2f gpu_upload_ms=%.3f\n",
+                         "gpu_evictions=%llu gpu_cache_resident=%zu gpu_upload_mib=%.2f gpu_upload_ms=%.3f "
+                         "gpu_upload_calls=%llu\n",
                          (unsigned long long) hook->gpu_hits(), (unsigned long long) hook->gpu_cpu_misses(),
                          (unsigned long long) gpu_promotions, (unsigned long long) gpu_experts.evictions(),
-                         gpu_experts.resident_count(), double(gpu_upload_bytes) / (1024.0 * 1024.0), gpu_upload_ms);
+                         gpu_experts.resident_count(), double(gpu_upload_bytes) / (1024.0 * 1024.0), gpu_upload_ms,
+                         (unsigned long long) gpu_upload_calls);
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend.
@@ -788,6 +828,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (cfg.gpu.n_gpu_layers < -1) return fail("n_gpu_layers must be -1 or nonnegative");
     if (cfg.gpu.main_gpu < 0) return fail("main_gpu must be nonnegative");
     if (cfg.gpu.expert_cache_mb < 0) return fail("gpu expert cache budget must be nonnegative");
+    if (cfg.gpu.safety_mb < 128) return fail("gpu safety rail must be at least 128 MiB");
     if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1))
         return fail("GPU expert cache needs MoE streaming and full CUDA layer placement");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
@@ -799,9 +840,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (cfg.gpu.n_gpu_layers != 0 &&
         (cfg.moe.row_stream || cfg.moe.drop_cold_frac > 0.0f || cfg.moe.substitute_lambda > 0.0f ||
          cfg.moe.route_ahead > 0 || cfg.moe.predict_log || cfg.moe.predict_prefetch || cfg.moe.prefetch_layers > 0 ||
-         cfg.decide.enabled || cfg.spec.enabled() || route_trace))
+         cfg.decide.enabled || cfg.spec.enabled()))
         return fail("CUDA hybrid currently supports exact streaming without row-stream, routing policies, "
-                    "speculation, decide, prefetch, or route trace");
+                    "speculation, decide, or prefetch");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
@@ -977,8 +1018,16 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     }
 
     llama_context_params cparams = llama_context_default_params();
+    if (!kv_cache_ggml_type(cfg.gpu.cache_type_k, cparams.type_k) ||
+        !kv_cache_ggml_type(cfg.gpu.cache_type_v, cparams.type_v)) {
+        return fail("invalid K/V cache type (expected f16, q8_0, or q4_0)");
+    }
     cparams.offload_kqv = cfg.gpu.n_gpu_layers != 0 && cfg.gpu.kv_offload;
-    cparams.op_offload = cfg.gpu.n_gpu_layers != 0;
+    // A wide prefill makes llama.cpp offload host-backed MUL_MAT_ID to CUDA when this is true.
+    // Streamed expert weights are sparse VM reservations: only routed slices are committed.
+    // Its selected-expert copy can read padding into an uncommitted neighboring slice.
+    // Keep those matmuls on CPU; GPU-backed dense weights still execute on CUDA.
+    cparams.op_offload = cfg.gpu.n_gpu_layers != 0 && !cfg.moe.enabled;
     switch (cfg.gpu.flash_attn) {
     case RunConfig::GpuConfig::FlashAttention::Auto:
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -1018,6 +1067,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return fail("failed to create context");
     im.ctx.reset(ctx);
+#ifdef _WIN32
+    std::fprintf(stderr, "bmoe-kv-cache: K=%s V=%s\n", ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v));
+#endif
     llama_set_n_threads(ctx, cfg.n_threads, cfg.n_threads);
 
     // The MTP draft context: same model, same eval callback, but ctx_type = MTP so llama.cpp builds
@@ -1229,7 +1281,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
         if (cfg.gpu.expert_cache_mb > 0) {
             std::string pool_error;
-            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, layers, pool_error))
+            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, layers, pool_error,
+                                     cfg.gpu.safety_mb))
                 return fail("GPU expert cache: " + pool_error);
             im.gpu_recent_miss.assign(layers.size() * size_t(n_expert), 0);
             im.gpu_queued.assign(layers.size() * size_t(n_expert), 0);
@@ -1369,6 +1422,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         }
 
         im.clear_memory(ctx); // discard warm-up KV
+        if (!cfg.moe.access_trace_path.empty() && !im.source.set_access_trace(cfg.moe.access_trace_path))
+            return fail("could not open expert access trace");
         if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }
 
@@ -2143,10 +2198,19 @@ RunResult Session::generate(const GenerateRequest & req,
     s.prefill_io_seconds = prefill_tally.io_seconds;
     s.prefill_stall_seconds = prefill_tally.stall_seconds;
     s.prefill_mgmt_seconds = prefill_tally.mgmt_seconds;
+    s.prefill_cache_hits = prefill_tally.post.prefill_cache_hits - prefill_tally.pre.prefill_cache_hits;
+    s.prefill_cache_lookups = prefill_tally.post.prefill_cache_lookups - prefill_tally.pre.prefill_cache_lookups;
+    s.prefill_retained_hits = prefill_tally.post.prefill_retained_hits - prefill_tally.pre.prefill_retained_hits;
+    s.prefill_transient_loads = prefill_tally.post.prefill_transient_loads - prefill_tally.pre.prefill_transient_loads;
+    s.prefill_rereads = prefill_tally.post.prefill_rereads - prefill_tally.pre.prefill_rereads;
+    s.prefill_retained_resident_mib = prefill_tally.post.prefill_retained_resident_bytes / (1024.0 * 1024.0);
+    s.prefill_transient_peak_mib = prefill_tally.post.prefill_transient_peak_bytes / (1024.0 * 1024.0);
+    s.prefill_cache_peak_mib = prefill_tally.post.prefill_cache_peak_bytes / (1024.0 * 1024.0);
     s.majflt_per_token = n_gen ? (double) tally.majflt / n_gen : 0.0;
     s.cpu_s_per_token = n_gen ? tally.cpu_seconds / n_gen : 0.0;
     if (moe.enabled) {
         IExpertSource::Stats st = im.source.stats();
+        s.prefill_protected_after_generation_mib = st.prefill_retained_resident_bytes / (1024.0 * 1024.0);
         s.moe_read_mib = tally.read_bytes / (1024.0 * 1024.0);
         s.moe_io_seconds = tally.io_seconds;
         s.moe_io_s_per_token = n_gen ? tally.io_seconds / n_gen : 0.0;

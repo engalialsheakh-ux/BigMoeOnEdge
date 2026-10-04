@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "record_date": "2026-10-04",
+  "status": "frozen_existing_measurement",
+  "model": {
+    "filename": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "architecture": "qwen35moe",
+    "weight_type": "Q4_K_M",
+    "size_bytes": 20419565568,
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7"
+  },
+  "prompt": {
+    "recipe": "prompt-recipe.ps1",
+    "encoding": "UTF-8 without BOM",
+    "bytes": 300104,
+    "sha256": "4fb37b40ed6e03e794b9249afe78d628f4d1b3dcfcdf2be2604f66f4fc51702f",
+    "tokens": 65507
+  },
+  "measured_reference": {
+    "decode_tokens_per_second": 9.389,
+    "prefill_tokens_per_second_approx": 15.77,
+    "prefill_seconds_approx": 4153.5,
+    "prefill_expert_rereads": 3334981,
+    "ram_expert_cache_mib": 4400,
+    "gpu_expert_cache_mib": 1500,
+    "gpu_safety_mib": 128,
+    "kv_type_k": "q4_0",
+    "kv_type_v": "q4_0",
+    "kv_placement": "CUDA",
+    "kv_allocation_mib_approx": 1440,
+    "cuda_compute_buffer_mib_approx": 70.3,
+    "direct_quantized_cuda_flash_attention": true,
+    "f16_flash_attention_scratch_bytes": 0,
+    "io_coalescing": true,
+    "exact_routing": true
+  },
+  "replay_or_simulation": {
+    "gpu_nonuniform_allocation_heldout_hit_delta": -150,
+    "best_gpu_route_prediction_miss_reduction_percent_approx": 0.20,
+    "best_gpu_route_prediction_speculative_upload_mib_approx": 16883,
+    "sidecar_heldout_read_window_reduction_percent_approx": 30.70,
+    "expert_centric_short_trace_ideal_io_reduction_percent_approx": 94.44,
+    "cuda_launch_optimistic_removable_ms_per_token_approx": 3.1
+  },
+  "short_real_model_ablation": {
+    "sidecar_read_window_reduction_percent_approx": 34.85,
+    "gguf_prefill_seconds_approx": 197.1,
+    "sidecar_prefill_seconds_approx": 219.7,
+    "gguf_decode_tokens_per_second_approx": 6.778,
+    "sidecar_decode_tokens_per_second_approx": 6.418
+  },
+  "validation_recorded": {
+    "cuda_release_build": "PASS",
+    "bigmoe_ctest": "30/30 PASS",
+    "git_diff_check": "PASS",
+    "clang_format_18": "PASS",
+    "full_model_rerun_during_freeze": false
+  }
+}

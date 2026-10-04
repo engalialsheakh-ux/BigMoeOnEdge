@@ -9,8 +9,8 @@
 # pins a fork branch (`bmoe/expert-ready-hook` on Helldez/llama.cpp) adding one ~25-line
 # readiness hook, detected here as BMOE_HAVE_EXPERT_READY_HOOK. It is zero-cost when absent,
 # the serial path still builds against stock upstream, and it sunsets the moment upstream
-# ships an equivalent callback. The uncommitted GPU expert-cache prototype adds an opt-in
-# CPU hit-skip experiment to that pin; see docs/seam.md for its exact seam.
+# ships an equivalent callback. The pinned fork also carries opt-in mixed CPU/GPU expert
+# execution and quantized CUDA FlashAttention; see docs/seam.md for the exact seam.
 #
 # llama.cpp is an optional dependency at configure time: when the submodule is absent
 # only the pure-policy code (config validation) compiles, so the scaffold and a subset
@@ -19,8 +19,9 @@ cmake_minimum_required(VERSION 3.21)
 
 # The version is declared here and nowhere else in the build: the engine reports it (bmoe-cli
 # --version, and the run-parameter preamble of every metrics CSV), so a committed benchmark file
-# says which engine produced it. Keep it in step with CHANGELOG.md and the app's versionName.
-project(bigmoeonedge VERSION 0.29.0 LANGUAGES CXX)
+# says which engine produced it. Keep it in step with CHANGELOG.md; the Android app version
+# advances separately when an app release includes the change.
+project(bigmoeonedge VERSION 0.31.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -129,7 +129,10 @@ public:
     // Derived from the graph's ops, so no architecture or tensor name appears in the rule.
     const std::unordered_set<const ggml_tensor *> & non_matrix_weights() const { return non_matrix_weights_; }
 
-    void set_source(IExpertSource * src) { source_ = src; } // non-null → stream mode
+    void set_source(IExpertSource * src) {
+        source_ = src;
+        if (source_) source_->set_batch_phase(batch_phase_);
+    } // non-null → stream mode
 
     void set_gpu_expert_pool(GpuExpertPool * pool);
     void begin_gpu_decode();
@@ -244,7 +247,10 @@ public:
     // Which phase the batch being decoded belongs to (0 = prefill, 1 = decode). The drop policy
     // is decode-only unless armed for prefill, and unlike the traces it must know this on every
     // run, so it cannot ride on begin_trace_batch.
-    void set_batch_phase(int phase) { batch_phase_ = phase; }
+    void set_batch_phase(int phase) {
+        batch_phase_ = phase;
+        if (source_) source_->set_batch_phase(phase);
+    }
     int batch_phase() const { return batch_phase_; }
 
     // Graph nodes whose output lives in a non-host buffer, i.e. that a device backend computed. The
@@ -323,6 +329,7 @@ private:
         std::vector<int32_t> ids;
         std::vector<float> weights;
         std::vector<uint8_t> residency;
+        std::vector<uint8_t> gpu_hits;
         std::vector<uint8_t> dropped; // set by the drop policy; all zero when it is off
     };
     void flush_pending();

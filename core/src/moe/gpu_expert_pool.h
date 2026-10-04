@@ -47,7 +47,8 @@ public:
               int budget_mb,
               int n_expert,
               const std::vector<LayerExperts> & experts,
-              std::string & error);
+              std::string & error,
+              int safety_mb = 768);
     void reset();
 
     // An upload owns a RESERVED lease until publish() or abandon(). A graph owns a

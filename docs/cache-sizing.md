@@ -8,6 +8,12 @@ the process (this is exactly why Gemma cannot use a 4000 MiB cache on an 11 GB p
 [benchmarks.md](benchmarks.md)). `--cache-mb auto` removes the guess: the engine sizes the cache to
 the device once at load and holds that budget for the whole run.
 
+The decode analysis below concerns the global LRU used after prefill. Batched prefill has a
+separate, exact retention policy: it reserves one discovered full expert bank as transient
+headroom and partitions the remaining budget across bound layers. Each batch retains a layer's
+most frequent routed entries, breaking ties by later use. The protection ends on decode, so
+the decode capacity and the measurements below retain their original meaning.
+
 ## The cliff: below one token cycle the hit rate is 0 %, not "low"
 
 Global LRU drops the least *recently* used entry. The model visits its layers in a fixed cycle

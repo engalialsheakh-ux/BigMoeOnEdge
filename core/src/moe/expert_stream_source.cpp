@@ -1,4 +1,6 @@
 #include "expert_stream_source.h"
+#include "prefill_cache_policy.h"
+#include "io_coalesce.h"
 
 #include "row_stream.h"
 
@@ -47,6 +49,7 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     load_all_ = cfg.load_all;
     overlap_ = cfg.overlap;
     two_wave_ = cfg.io_two_wave;
+    coalesce_ = cfg.io_coalesce;
     prefetch_sync_ = cfg.prefetch_sync && !cfg.overlap; // serial only: overlap lane 0 is a worker
     // Under route-ahead the speculated ids of a layer ARE the ids its topk will commit, so the
     // demand load adopts that layer's in-flight speculation instead of discarding and re-reading
@@ -193,6 +196,14 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
         cgen_ = 0;
         chits_ = 0;
         clookups_ = 0;
+        prefill_quota_.assign(n_layer_, 0);
+        prefill_retained_.assign(n_entry, 0);
+        prefill_demand_.assign(n_entry, 0);
+        prefill_prior_.assign(n_expert_, 0);
+        prefill_freq_.assign(n_expert_, 0);
+        prefill_last_.assign(n_expert_, -1);
+        prefill_ranked_.reserve(n_expert_);
+        configure_prefill_budget();
     }
 
     // Read pool: one reader per shard file, each owning a private fd + bounce per lane so concurrent
@@ -313,6 +324,12 @@ bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
     const auto t0 = clock_t_::now();
     const long long window = readers_[(size_t) j.file]->read(lane, j.dst, j.off, j.nbytes);
     if (window < 0) return false;
+    if (coalesce_ && !j.spec) {
+        demand_logical_bytes_.fetch_add(j.nbytes, std::memory_order_relaxed);
+        demand_physical_bytes_.fetch_add(uint64_t(window), std::memory_order_relaxed);
+        demand_read_windows_.fetch_add(1, std::memory_order_relaxed);
+        demand_merged_ranges_.fetch_add(j.merged_count - 1, std::memory_order_relaxed);
+    }
 
     if (io_trace_on_) {
         const uint64_t lat_ns =
@@ -333,6 +350,26 @@ bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
     return true;
 }
 
+void ExpertStreamSource::coalesce_jobs(size_t first) {
+    if (!coalesce_ || jobs_.size() <= first + 1) return;
+    constexpr uint64_t max_read = 4ull * 1024 * 1024;
+    auto span = [](const IoJob & job) {
+        return detail::CoalesceSpan{job.off,  job.nbytes, uintptr_t(job.dst), job.file, job.layer,
+                                    job.proj, job.expert, job.merged_count,   job.flag, job.spec != 0};
+    };
+    size_t out = first;
+    for (size_t i = first; i < jobs_.size(); ++i) {
+        const IoJob & incoming = jobs_[i];
+        if (out > first && detail::can_coalesce(span(jobs_[out - 1]), span(incoming), max_read)) {
+            jobs_[out - 1].nbytes += incoming.nbytes;
+            jobs_[out - 1].merged_count += incoming.merged_count;
+        } else {
+            jobs_[out++] = incoming;
+        }
+    }
+    jobs_.resize(out);
+}
+
 void ExpertStreamSource::set_io_trace(bool on) {
     std::lock_guard<std::mutex> lk(io_trace_mtx_);
     io_trace_on_ = on;
@@ -343,6 +380,52 @@ void ExpertStreamSource::take_io_trace_rows(std::vector<IoTraceRow> & out) {
     std::lock_guard<std::mutex> lk(io_trace_mtx_);
     out.swap(io_trace_rows_);
     io_trace_rows_.clear();
+}
+
+bool ExpertStreamSource::set_access_trace(const std::string & path) {
+    if (!active_ || access_trace_ || path.empty()) return false;
+    access_trace_ = std::fopen(path.c_str(), "wb");
+    if (!access_trace_) return false;
+    access_trace_buffer_.resize(1 << 20);
+    std::setvbuf(access_trace_, access_trace_buffer_.data(), _IOFBF, access_trace_buffer_.size());
+    auto put = [&](const auto & value) { return std::fwrite(&value, sizeof(value), 1, access_trace_) == 1; };
+    const uint32_t version = 3, n_layer = uint32_t(n_layer_), n_expert = uint32_t(n_expert_);
+    const uint32_t flags = overlap_ ? 1u : 0u;
+    if (std::fwrite("BMOA", 1, 4, access_trace_) != 4 || !put(version) || !put(n_layer) || !put(n_expert) ||
+        !put(uint64_t(cache_max_)) || !put(flags))
+        return false;
+    for (int il = 0; il < n_layer_; ++il) {
+        if (!put(uint64_t(entry_bytes(il)))) return false;
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            const auto & proj = layers_[il].proj[p];
+            if (!put(proj.file_off) || !put(proj.nb2) || !put(int32_t(proj.file_idx))) return false;
+        }
+    }
+    return true;
+}
+
+bool ExpertStreamSource::write_access_trace(int il,
+                                            const int32_t * ids,
+                                            int n_ids,
+                                            long long lookups_before,
+                                            long long hits_before,
+                                            long long rereads_before,
+                                            long long evictions_before) {
+    if (!access_trace_) return true;
+    auto put = [&](const auto & value) { return std::fwrite(&value, sizeof(value), 1, access_trace_) == 1; };
+    const uint8_t marker = 'B', phase = prefill_phase_ ? 0 : 1;
+    const uint16_t layer = uint16_t(il);
+    const uint32_t count = uint32_t(n_ids);
+    const uint32_t lookups = uint32_t(clookups_ - lookups_before), hits = uint32_t(chits_ - hits_before);
+    const uint32_t rereads = uint32_t(rereads_ - rereads_before), evictions = uint32_t(evictions_ - evictions_before);
+    uint64_t logical_bytes = 0;
+    for (const IoJob & job : jobs_)
+        logical_bytes += job.nbytes;
+    const bool ok = put(marker) && put(phase) && put(layer) && put(count) && put(lookups) && put(hits) &&
+                    put(rereads) && put(evictions) && put(logical_bytes) &&
+                    std::fwrite(ids, sizeof(int32_t), count, access_trace_) == count;
+    if (!ok) std::fprintf(stderr, "bmoe: expert access trace write failed\n");
+    return ok;
 }
 
 void ExpertStreamSource::io_drain(int lane, uint64_t my_gen) {
@@ -369,7 +452,8 @@ void ExpertStreamSource::io_drain(int lane, uint64_t my_gen) {
             // and gets woken. With nobody waiting — the common case, since a slice usually lands
             // inside the spin — this costs one atomic load instead of a mutex plus a notify_all that
             // woke EVERY compute thread blocked on ANY expert to re-check its own predicate.
-            ready_[(size_t) j.flag].gen.store(batch_flag_gen_, std::memory_order_seq_cst);
+            for (int k = 0; k < j.merged_count; ++k)
+                ready_[(size_t) (j.flag + k)].gen.store(batch_flag_gen_, std::memory_order_seq_cst);
             if (ready_waiters_.load(std::memory_order_seq_cst) != 0) {
                 std::lock_guard<std::mutex> lk(ready_mtx_);
                 ready_cv_.notify_all();
@@ -478,7 +562,10 @@ void ExpertStreamSource::prefetch(int il, const int32_t * ids, int n_ids) {
             break;
         }
         if (njobs == 0) continue;
-        if (ever_evicted_[id]) ++rereads_; // same accounting on the speculative path
+        if (ever_evicted_[id]) {
+            ++rereads_; // same accounting on the speculative path
+            if (prefill_phase_) ++prefill_rereads_;
+        }
         staged_ids.push_back(id);
         staged_counts.push_back(njobs);
         any = true;
@@ -643,6 +730,13 @@ void ExpertStreamSource::quiesce_spec(int adopt_il) {
         cspec_[id] = 1;  // speculative until a real lookup hits it (then counted useful)
         cstamp_[id] = 0; // not used this generation → evictable if the budget is tight
         cresident_ += entry_bytes(id / n_expert_);
+        if (prefill_phase_) {
+            prefill_cache_peak_ = std::max(prefill_cache_peak_, cresident_);
+            if (prefill_retained_[id])
+                prefill_retained_bytes_ += entry_bytes(id / n_expert_);
+            else
+                ++prefill_transient_loads_;
+        }
         lru_push_back(id); // cold end: a mispredicted expert is reclaimed before any demanded one
         spec_experts_.fetch_add(1);
     }
@@ -690,6 +784,7 @@ void ExpertStreamSource::set_cache_budget(size_t bytes) {
         // Growing evicts nothing, so it needs no quiesce — and must not do one: cancelling the
         // speculative reads in flight on every grow would quietly defeat --prefetch.
         cache_max_ = std::min(bytes, total_expert_bytes_);
+        configure_prefill_budget();
         ++cache_resizes_;
         return;
     }
@@ -699,6 +794,7 @@ void ExpertStreamSource::set_cache_budget(size_t bytes) {
     // chosen at init), and load_layer branches on cache_max_ == 0 to pick shared-slot vs LRU — so a
     // runtime zero would route into buffers that do not exist. This shrinks toward, never to, zero.
     cache_max_ = std::max<size_t>(1, bytes);
+    configure_prefill_budget();
     ++cache_resizes_;
     // No cstamp guard: with no decode in flight, nothing is staged for the current generation, so
     // every resident entry (coldest first) is a valid eviction target.
@@ -770,15 +866,77 @@ void ExpertStreamSource::release_entry_pages(int32_t id) {
         if (a1 > a0) pio::vm_evict((void *) a0, (size_t) (a1 - a0));
     }
 }
-void ExpertStreamSource::evict_tail() {
-    const int32_t id = ctail_;
+void ExpertStreamSource::evict_entry(int32_t id) {
     ++evictions_;
     ever_evicted_[id] = 1; // the next read of this entry is the cache paying twice
+    if (prefill_retained_[id]) {
+        prefill_retained_bytes_ -= entry_bytes(id / n_expert_);
+        prefill_retained_[id] = 0;
+    }
     release_entry_pages(id);
     cvalid_[id] = 0;
     cspec_[id] = 0;
     cresident_ -= entry_bytes(id / n_expert_);
     lru_unlink(id);
+}
+void ExpertStreamSource::evict_tail() {
+    evict_entry(ctail_);
+}
+
+void ExpertStreamSource::configure_prefill_budget() {
+    if (cache_max_ == 0) return;
+    std::fill(prefill_retained_.begin(), prefill_retained_.end(), 0);
+    prefill_retained_bytes_ = 0;
+    std::vector<size_t> units(n_layer_, 0);
+    for (int il = 0; il < n_layer_; ++il)
+        if (layers_[il].bound) units[il] = entry_bytes(il);
+    detail::PrefillBudget planned = detail::prefill_budget(units, n_expert_, cache_max_);
+    prefill_headroom_ = planned.headroom;
+    prefill_quota_ = std::move(planned.quota);
+}
+
+void ExpertStreamSource::set_batch_phase(int phase) {
+    const bool next = phase == 0 && cache_max_ > 0 && !load_all_;
+    if (next == prefill_phase_) return;
+    prefill_phase_ = next;
+    // The resident entries remain in the normal LRU on decode; only their prefill protection ends.
+    std::fill(prefill_retained_.begin(), prefill_retained_.end(), 0);
+    prefill_retained_bytes_ = 0;
+    if (next) {
+        prefill_transient_peak_ = 0;
+        prefill_cache_peak_ = cresident_;
+    }
+}
+
+void ExpertStreamSource::plan_prefill_layer(int il, const int32_t * ids, int n_ids) {
+    std::fill(prefill_demand_.begin(), prefill_demand_.end(), 0);
+    detail::rank_prefill_ids(ids, n_ids, n_expert_, prefill_freq_, prefill_last_, prefill_ranked_);
+    const size_t base = (size_t) il * n_expert_;
+    for (int e : prefill_ranked_)
+        prefill_demand_[base + e] = 1;
+    const size_t unit = entry_bytes(il);
+    for (int e = 0; e < n_expert_; ++e) {
+        const size_t id = base + e;
+        prefill_prior_[e] = prefill_retained_[id] && cvalid_[id];
+        if (prefill_retained_[id] && cvalid_[id]) prefill_retained_bytes_ -= unit;
+        prefill_retained_[id] = 0;
+    }
+    const size_t n_keep = std::min(prefill_ranked_.size(), prefill_quota_[il] / unit);
+    for (size_t i = 0; i < n_keep; ++i) {
+        const size_t id = base + prefill_ranked_[i];
+        prefill_retained_[id] = 1;
+        if (cvalid_[id]) prefill_retained_bytes_ += unit;
+    }
+}
+
+void ExpertStreamSource::evict_prefill_excess(size_t incoming_bytes) {
+    const size_t target = incoming_bytes >= cache_max_ ? 0 : cache_max_ - incoming_bytes;
+    int32_t id = ctail_;
+    while (cresident_ > target && id != -1) {
+        const int32_t prev = cprev_[id];
+        if (!prefill_retained_[id] && !prefill_demand_[id]) evict_entry(id);
+        id = prev;
+    }
 }
 
 // ── route-trace support: describe what a routing costs, without changing it ─────────
@@ -844,6 +1002,13 @@ void ExpertStreamSource::spec_integrate_done() {
         cspec_[id] = 1;  // speculative until a real lookup hits it (then counted useful)
         cstamp_[id] = 0; // not used this generation → evictable if the budget is tight
         cresident_ += entry_bytes(id / n_expert_);
+        if (prefill_phase_) {
+            prefill_cache_peak_ = std::max(prefill_cache_peak_, cresident_);
+            if (prefill_retained_[id])
+                prefill_retained_bytes_ += entry_bytes(id / n_expert_);
+            else
+                ++prefill_transient_loads_;
+        }
         // Cold end for a GUESS (a mispredicted expert should be the first thing reclaimed) — but
         // under route-ahead there are no guesses: every integrated entry is a read some layer
         // COMMITTED to, at most N layers from being routed. Entering it cold handed it to the
@@ -945,9 +1110,14 @@ bool ExpertStreamSource::commit_proj_pages(int il, int e, int p) {
 bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, int commit_only_proj) {
     const int32_t id = il * n_expert_ + e;
     clookups_++;
+    if (prefill_phase_) ++prefill_lookups_;
     cstamp_[id] = cgen_;
     if (cvalid_[id]) {
         chits_++;
+        if (prefill_phase_) {
+            ++prefill_hits_;
+            if (prefill_prior_[e]) ++prefill_retained_hits_;
+        }
         if (cspec_[id]) { // this hit was served by a speculative prefetch — count it useful once
             spec_useful_.fetch_add(1);
             cspec_[id] = 0;
@@ -969,10 +1139,20 @@ bool ExpertStreamSource::touch_entry(int il, int e, bool & hit, bool promote, in
         if (commit_only_proj >= 0 && p != commit_only_proj) continue;
         if (!commit_proj_pages(il, e, p)) return false;
     }
-    if (ever_evicted_[id]) ++rereads_; // this entry was resident once; the cache is buying it again
+    if (ever_evicted_[id]) {
+        ++rereads_; // this entry was resident once; the cache is buying it again
+        if (prefill_phase_) ++prefill_rereads_;
+    }
     cvalid_[id] = 1;
     cspec_[id] = 0; // a real read, not speculative
     cresident_ += entry_bytes(il);
+    if (prefill_phase_) {
+        prefill_cache_peak_ = std::max(prefill_cache_peak_, cresident_);
+        if (prefill_retained_[id])
+            prefill_retained_bytes_ += entry_bytes(il);
+        else
+            ++prefill_transient_loads_;
+    }
     lru_push_front(id);
     hit = false;
     return true;
@@ -989,11 +1169,20 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
     // Cache-management work (vm commit + LRU bookkeeping, then eviction below) is timed into
     // mgmt_ns_ so the metrics can split it out of the compute residual instead of hiding it there.
     const auto tm0 = clock_t_::now();
+    const long long trace_lookups = clookups_, trace_hits = chits_, trace_rereads = rereads_,
+                    trace_evictions = evictions_;
 
     // Integrate / discard any speculative prefetch before this layer's real staging touches the
     // cache. After this returns no spec read is in flight and completed ones are resident hits. The
     // budget is fixed for the run (auto sizes it once at init), so there is nothing to resize here.
     if (cache_max_) quiesce_spec(spec_adopt_ ? il : -1);
+    if (prefill_phase_) {
+        plan_prefill_layer(il, ids, n_ids);
+        size_t incoming = 0;
+        for (int e : prefill_ranked_)
+            if (!cvalid_[(size_t) il * n_expert_ + e]) incoming += entry_bytes(il);
+        evict_prefill_excess(incoming);
+    }
 
     auto stage = [&](int e) -> bool {
         if (cache_max_ == 0) {
@@ -1085,12 +1274,18 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
 
     if (cache_max_) {
         const auto te0 = clock_t_::now();
-        while (cresident_ > cache_max_ && ctail_ != -1 && cstamp_[ctail_] != cgen_)
-            evict_tail();
+        if (prefill_phase_) {
+            prefill_cache_peak_ = std::max(prefill_cache_peak_, cresident_);
+            prefill_transient_peak_ = std::max(prefill_transient_peak_, cresident_ - prefill_retained_bytes_);
+            evict_prefill_excess(0);
+        } else {
+            while (cresident_ > cache_max_ && ctail_ != -1 && cstamp_[ctail_] != cgen_)
+                evict_tail();
+        }
         mgmt_ns_.fetch_add(
             (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - te0).count());
     }
-    return true;
+    return write_access_trace(il, ids, n_ids, trace_lookups, trace_hits, trace_rereads, trace_evictions);
 }
 
 // ── overlap load: publish the routed reads, mark readiness, return without waiting ──────
@@ -1120,11 +1315,20 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     // the end) runs on the eval thread and would otherwise hide inside the compute residual. Time
     // it into mgmt_ns_ so the metrics can surface it. The drain wait above is I/O, not mgmt.
     const auto tm0 = clock_t_::now();
+    const long long trace_lookups = clookups_, trace_hits = chits_, trace_rereads = rereads_,
+                    trace_evictions = evictions_;
 
     // Integrate / discard speculative prefetch before this layer's real staging (the previous
     // batch is already drained above, so this only waits on in-flight spec reads). The budget is
     // fixed for the run, so there is nothing to resize here.
     if (cache_max_) quiesce_spec(spec_adopt_ ? il : -1);
+    if (prefill_phase_) {
+        plan_prefill_layer(il, ids, n_ids);
+        size_t incoming = 0;
+        for (int e : prefill_ranked_)
+            if (!cvalid_[(size_t) il * n_expert_ + e]) incoming += entry_bytes(il);
+        evict_prefill_excess(incoming);
+    }
 
     // 2. New generation for this layer. A flag counts as ready only once its gen matches.
     const uint32_t gen = async_gen_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1221,6 +1425,7 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
         } else {
             // Wave one: the first projection's jobs, published before anything else is committed.
             emit_proj(p0);
+            coalesce_jobs(0);
             {
                 std::lock_guard<std::mutex> lk(io_mtx_);
                 batch_njobs_ = jobs_.size();
@@ -1251,8 +1456,10 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
             }
             {
                 std::lock_guard<std::mutex> lk(io_mtx_);
+                const size_t wave_two_start = jobs_.size();
                 for (int p = 0; p < MoeRecipe::max_exps; ++p)
                     if (p != p0) emit_proj(p);
+                coalesce_jobs(wave_two_start);
                 batch_njobs_ = jobs_.size();
             }
             io_cv_.notify_all();
@@ -1287,6 +1494,7 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     //    flip the flags as they go; the compute threads block on those flags via the hook.
     //    (A two-wave batch already published both waves inside the staging branch.)
     if (!published) {
+        coalesce_jobs(0);
         {
             std::lock_guard<std::mutex> lk(io_mtx_);
             batch_njobs_ = jobs_.size();
@@ -1303,10 +1511,22 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     //    guaranteed no stale in-flight jobs, and current-gen entries (cstamp_ == cgen_) — the
     //    ones just staged — are never chosen, so eviction only releases pages nobody is reading.
     if (cache_max_) {
-        while (cresident_ > cache_max_ && ctail_ != -1 && cstamp_[ctail_] != cgen_)
-            evict_tail();
+        if (prefill_phase_) {
+            prefill_cache_peak_ = std::max(prefill_cache_peak_, cresident_);
+            prefill_transient_peak_ = std::max(prefill_transient_peak_, cresident_ - prefill_retained_bytes_);
+            evict_prefill_excess(0);
+        } else {
+            while (cresident_ > cache_max_ && ctail_ != -1 && cstamp_[ctail_] != cgen_)
+                evict_tail();
+        }
     }
     mgmt_ns_.fetch_add((long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - tm0).count());
+    if (!write_access_trace(il, ids, n_ids, trace_lookups, trace_hits, trace_rereads, trace_evictions)) {
+        fatal_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(ready_mtx_);
+        ready_cv_.notify_all();
+        return false;
+    }
     return true;
 }
 
@@ -1411,6 +1631,14 @@ IExpertSource::Stats ExpertStreamSource::stats() const {
     s.spec_useful = spec_useful_.load();
     s.cache_hits = chits_;
     s.cache_lookups = clookups_;
+    s.prefill_cache_hits = prefill_hits_;
+    s.prefill_cache_lookups = prefill_lookups_;
+    s.prefill_retained_hits = prefill_retained_hits_;
+    s.prefill_transient_loads = prefill_transient_loads_;
+    s.prefill_rereads = prefill_rereads_;
+    s.prefill_retained_resident_bytes = prefill_retained_bytes_;
+    s.prefill_transient_peak_bytes = prefill_transient_peak_;
+    s.prefill_cache_peak_bytes = prefill_cache_peak_;
     s.cache_resident_bytes = (uint64_t) cresident_;
     s.stall_seconds = stall_union_.total_ns() / 1e9;
     s.cache_budget_bytes = (uint64_t) cache_max_;
@@ -1427,6 +1655,11 @@ IExpertSource::Stats ExpertStreamSource::stats() const {
 }
 
 void ExpertStreamSource::shutdown() {
+    if (access_trace_) {
+        std::fclose(access_trace_);
+        access_trace_ = nullptr;
+        access_trace_buffer_.clear();
+    }
     if (!active_) return;
 #ifdef BMOE_HAVE_EXPERT_READY_HOOK
     // Unregister the process-global hook FIRST: after this no compute thread can enter
@@ -1453,6 +1686,16 @@ void ExpertStreamSource::shutdown() {
     io_cv_done_.notify_all();
     for (auto & t : io_pool_)
         if (t.joinable()) t.join();
+    if (coalesce_) {
+        const uint64_t logical = demand_logical_bytes_.load(), physical = demand_physical_bytes_.load();
+        std::fprintf(stderr,
+                     "bmoe-io-coalesce: logical_mib=%.1f physical_mib=%.1f read_windows=%llu merged_ranges=%llu "
+                     "overread_mib=%.1f\n",
+                     double(logical) / (1024 * 1024), double(physical) / (1024 * 1024),
+                     (unsigned long long) demand_read_windows_.load(),
+                     (unsigned long long) demand_merged_ranges_.load(),
+                     (double(physical) - double(logical)) / (1024 * 1024));
+    }
     io_pool_.clear();
     spec_done_.clear();
     spec_done_pending_.store(0, std::memory_order_relaxed);

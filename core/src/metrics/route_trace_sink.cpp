@@ -18,7 +18,7 @@ public:
         // A `#` preamble keeps the trace self-contained — the same spirit as the metrics CSV's
         // `# summary` trailer: the static facts a row cannot carry travel with the rows, so a
         // trace file is analysable without the model that produced it.
-        std::fprintf(f_, "# route_trace v1\n");
+        std::fprintf(f_, "# route_trace v3\n");
         std::fprintf(f_, "# model=%s arch=%s n_layer=%d n_expert=%d n_expert_used=%d\n", s.model.c_str(),
                      s.arch.c_str(), s.n_layer, s.n_expert, s.n_expert_used);
         for (size_t il = 0; il < s.expert_bytes_per_layer.size(); ++il) {
@@ -26,7 +26,7 @@ public:
             std::fprintf(f_, "# layer=%zu expert_bytes=%llu dense_bytes=%llu\n", il,
                          (unsigned long long) s.expert_bytes_per_layer[il], (unsigned long long) dense);
         }
-        std::fprintf(f_, "turn,phase,step,layer,slot,expert,weight,residency,expert_bytes,dropped\n");
+        std::fprintf(f_, "turn,phase,step,layer,slot,expert,weight,residency,expert_bytes,dropped,gpu_hit\n");
         std::fflush(f_);
     }
 
@@ -36,15 +36,26 @@ public:
             // A weight the graph never exposed prints as nan, not 0: "unknown" must not read as
             // "the router gave this expert no mass".
             if (std::isnan(r.weight))
-                std::fprintf(f_, "%d,%d,%d,%d,%d,%d,nan,%u,%llu,%u\n", r.turn, r.phase, r.step, r.layer, r.slot,
+                std::fprintf(f_, "%d,%d,%d,%d,%d,%d,nan,%u,%llu,%u,%u\n", r.turn, r.phase, r.step, r.layer, r.slot,
                              (int) r.expert, (unsigned) r.residency, (unsigned long long) r.expert_bytes,
-                             (unsigned) r.dropped);
+                             (unsigned) r.dropped, (unsigned) r.gpu_hit);
             else
-                std::fprintf(f_, "%d,%d,%d,%d,%d,%d,%.6g,%u,%llu,%u\n", r.turn, r.phase, r.step, r.layer, r.slot,
+                std::fprintf(f_, "%d,%d,%d,%d,%d,%d,%.6g,%u,%llu,%u,%u\n", r.turn, r.phase, r.step, r.layer, r.slot,
                              (int) r.expert, (double) r.weight, (unsigned) r.residency,
-                             (unsigned long long) r.expert_bytes, (unsigned) r.dropped);
+                             (unsigned long long) r.expert_bytes, (unsigned) r.dropped, (unsigned) r.gpu_hit);
         }
         std::fflush(f_); // once per decode, not per row
+    }
+
+    void on_gpu_events(const GpuCacheTraceEvent * events, size_t n) override {
+        if (!n) return;
+        std::fprintf(f_, "# gpu_events: turn,step,layer,expert,kind,bundle_bytes,evicted\n");
+        for (size_t i = 0; i < n; ++i) {
+            const GpuCacheTraceEvent & e = events[i];
+            std::fprintf(f_, "# gpu_event,%d,%d,%d,%d,%c,%llu,%u\n", e.turn, e.step, e.layer, e.expert, e.kind,
+                         (unsigned long long) e.bundle_bytes, (unsigned) e.evicted);
+        }
+        std::fflush(f_);
     }
 
 private:

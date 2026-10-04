@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.31.0] - 2026-10-02
+
+### Added
+- Add optional exact expert-access tracing and offline cache-policy replay, plus bounded adjacent
+  demand-read coalescing for the Windows CUDA expert streamer.
+- Allow the Windows CLI to configure the GPU expert-cache dedicated VRAM safety rail with
+  `--gpu-safety-mb` (default 768 MiB, minimum 128 MiB) and report allocation headroom.
+- Optional Windows CUDA FlashAttention dispatch diagnostics, including vector/MMA
+  call counts and F16 K/V scratch allocation, to make quantized-KV runs auditable.
+- Share quantized K/V reads across GQA heads in the CUDA vector FlashAttention
+  kernel for eligible small decode batches on pre-Ada GPUs.
+- Expand Q4_0 and Q8_0 KV inside eligible CUDA MMA FlashAttention tiles instead
+  of converting the active context to F16; retain the legacy fallback and an
+  opt-in A/B control.
+- Extend direct quantized CUDA MMA to 64-query prefill and measured long-context
+  Ampere decode, with separate decode/prefill dispatch counters.
+- Preserve a frequency-ranked RAM expert subset per MoE layer across batched prefill chunks,
+  with a model-derived active-layer headroom and prefill-only cache diagnostics.
+- Windows CLI controls for llama.cpp KV key/value cache types (`f16`, `q8_0`, `q4_0`),
+  with F16/F16 defaults and startup diagnostics.
+- Windows CLI `--cpu-affinity-mask` and `--gpu-expert-window` controls for measured
+  CPU placement and VRAM expert admission. The CUDA route trace now records VRAM
+  hits and cache candidate, staging, publication, bundle-byte, and eviction events.
+  The cache diagnostic reports upload calls.
+
+### Fixed
+- Keep streamed CPU expert matmuls on CPU during batched CUDA-hybrid prefill. llama.cpp's
+  host-operation offload threshold could otherwise move them to CUDA and copy past a
+  selected expert into the streamer's uncommitted cache pages.
+- Give each Windows test executable its own runtime directory. Parallel MSBuild
+  can then stage changed ggml/CUDA DLLs without concurrent copies into one directory.
+
+### Docs
+- Record the local exact CUDA cache, CPU instruction-path, H2D packing, fusion,
+  and SSD optimization screens in the max-speed experiment ledger.
+- Record exact-mode GPU allocation, prediction, prefill, paired sidecar,
+  DirectStorage, partial-residency, and CUDA dispatch evidence. Keep rejected
+  runtime candidates out of the production path.
+- Freeze the existing 65,507-token exact baseline with source revisions,
+  prompt/model hashes, environment, configuration, and ablation decisions.
+
 ## [0.30.0] - 2026-10-02
 
 ### Added

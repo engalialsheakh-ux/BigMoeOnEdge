@@ -131,6 +131,16 @@ struct RunSummary {
     double prefill_io_seconds = 0.0;
     double prefill_stall_seconds = 0.0;
     double prefill_mgmt_seconds = 0.0;
+    long long prefill_cache_hits = 0;
+    long long prefill_cache_lookups = 0;
+    long long prefill_retained_hits = 0;
+    long long prefill_transient_loads = 0;
+    long long prefill_rereads = 0;
+    double prefill_retained_resident_mib = 0.0;
+    double prefill_transient_peak_mib = 0.0;
+    double prefill_cache_peak_mib = 0.0;
+    // The final source snapshot proves that decode released prefill-only protection.
+    double prefill_protected_after_generation_mib = 0.0;
     // Of n_prompt, the tokens whose prefill graph ran on the prefill device (RunConfig::prefill).
     // Zero when that is off, and for a prompt too short to reach it. What proves the device ran.
     int prefill_device_tokens = 0;

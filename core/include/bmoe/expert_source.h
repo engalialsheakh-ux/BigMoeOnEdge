@@ -28,6 +28,10 @@ public:
     // Returns false on I/O failure (serial) or if a prior async batch already failed.
     virtual bool load_layer(int il, const int32_t * ids, int n_ids) = 0;
 
+    // The router knows whether its current graph is prefill (0) or decode (1).
+    // Sources without a phase-specific cache policy can ignore this signal.
+    virtual void set_batch_phase(int /*phase*/) {}
+
     // Hint that layer `il` is likely to route `ids` (n_ids of them) on a future token, so the
     // implementation may read them ahead on otherwise-idle lanes. Purely advisory: a correct
     // guess makes the later load_layer(il, …) a cache hit, a wrong guess wastes a read — neither
@@ -66,11 +70,19 @@ public:
 
     // Cumulative streaming statistics, for telemetry and the end-of-run summary.
     struct Stats {
-        uint64_t read_bytes = 0;           // bytes pulled from flash (aligned windows)
-        double read_seconds = 0.0;         // wall time spent in the read phase
-        double mgmt_seconds = 0.0;         // cache management: vm commit + evict + LRU bookkeeping
-        long long cache_hits = 0;          // expert lookups served from the cache
-        long long cache_lookups = 0;       // total expert lookups (hits + misses)
+        uint64_t read_bytes = 0;     // bytes pulled from flash (aligned windows)
+        double read_seconds = 0.0;   // wall time spent in the read phase
+        double mgmt_seconds = 0.0;   // cache management: vm commit + evict + LRU bookkeeping
+        long long cache_hits = 0;    // expert lookups served from the cache
+        long long cache_lookups = 0; // total expert lookups (hits + misses)
+        long long prefill_cache_hits = 0;
+        long long prefill_cache_lookups = 0;
+        long long prefill_retained_hits = 0;
+        long long prefill_transient_loads = 0;
+        long long prefill_rereads = 0;
+        uint64_t prefill_retained_resident_bytes = 0;
+        uint64_t prefill_transient_peak_bytes = 0;
+        uint64_t prefill_cache_peak_bytes = 0;
         uint64_t cache_resident_bytes = 0; // currently resident cached slice bytes
         double stall_seconds = 0.0;        // overlap: cumulative wall time during which at least one compute
                                            // thread was stalled on a streamed expert — the UNION of stalled

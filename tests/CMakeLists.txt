@@ -5,8 +5,19 @@
 
 add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
+add_executable(bmoe_prefill_cache_policy_test prefill_cache_policy_test.cpp)
+target_include_directories(bmoe_prefill_cache_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME prefill_cache_policy COMMAND bmoe_prefill_cache_policy_test)
+add_executable(bmoe_io_coalesce_test io_coalesce_test.cpp)
+target_link_libraries(bmoe_io_coalesce_test PRIVATE bmoe_core)
+target_include_directories(bmoe_io_coalesce_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME io_coalesce COMMAND bmoe_io_coalesce_test)
+add_executable(bmoe_prefill_cache_gate prefill_cache_gate.cpp)
+target_link_libraries(bmoe_prefill_cache_gate PRIVATE bmoe_core)
 add_executable(bmoe_hybrid_gpu_gate hybrid_gpu_gate.cpp)
 target_link_libraries(bmoe_hybrid_gpu_gate PRIVATE bmoe_core)
+add_executable(bmoe_hybrid_prefill_gate hybrid_prefill_gate.cpp)
+target_link_libraries(bmoe_hybrid_prefill_gate PRIVATE bmoe_core)
 add_executable(bmoe_gpu_expert_pool_test gpu_expert_pool_test.cpp)
 target_link_libraries(bmoe_gpu_expert_pool_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
@@ -113,12 +124,19 @@ target_include_directories(bmoe_decide_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src
 add_test(NAME decide_policy COMMAND bmoe_decide_test)
 
 foreach(_test_target IN ITEMS
-        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
+        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_hybrid_prefill_gate bmoe_prefill_cache_gate
+        bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
         bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test
         bmoe_cpu_expert_skip_test
         bmoe_chat_parse_test bmoe_think_control_test
         bmoe_config_test bmoe_mapping_release_test bmoe_ngram_test bmoe_stall_union_test
-        bmoe_csv_summary_test bmoe_decide_test)
+        bmoe_csv_summary_test bmoe_decide_test bmoe_io_coalesce_test)
+    if(WIN32)
+        # Parallel MSBuild otherwise copies changed backend DLLs into the same tests/Release
+        # directory from multiple post-build steps, which can fail with a sharing violation.
+        set_target_properties(${_test_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime/${_test_target}")
+    endif()
     bmoe_stage_runtime_dlls(${_test_target})
 endforeach()
 
@@ -128,6 +146,36 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import gguf, numpy"
 if(NOT _python_deps_result EQUAL 0)
     message(FATAL_ERROR "MoE fixture tests require gguf and numpy in ${Python3_EXECUTABLE}. "
         "Install with: py -m pip install gguf numpy\n${_python_deps_error}")
+endif()
+
+set(_prefill_cache_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-prefill-cache.gguf")
+add_test(NAME moe_make_tiny_model_prefill_cache
+         COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py
+                 --arch qwen3moe --prefill-cache --out ${_prefill_cache_model})
+set_tests_properties(moe_make_tiny_model_prefill_cache PROPERTIES FIXTURES_SETUP TINY_MOE_PREFILL_CACHE)
+add_test(NAME prefill_cache_gate COMMAND bmoe_prefill_cache_gate ${_prefill_cache_model})
+set_tests_properties(prefill_cache_gate PROPERTIES
+    FIXTURES_REQUIRED TINY_MOE_PREFILL_CACHE FIXTURES_SETUP EXPERT_ACCESS_TRACE)
+add_test(NAME expert_sidecar_builder
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/tests/expert_sidecar_build_test.py
+            --model ${_prefill_cache_model}
+            --trace ${_prefill_cache_model}.access
+            --output ${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-prefill-cache.bmoeside)
+set_tests_properties(expert_sidecar_builder PROPERTIES FIXTURES_REQUIRED EXPERT_ACCESS_TRACE)
+add_test(NAME expert_access_replay
+         COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/expert-access-replay.py
+                 ${_prefill_cache_model}.access --budget-mb 2)
+set_tests_properties(expert_access_replay PROPERTIES FIXTURES_REQUIRED EXPERT_ACCESS_TRACE)
+
+if(GGML_CUDA)
+    set(_hybrid_prefill_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-hybrid-prefill.gguf")
+    add_test(NAME moe_make_tiny_model_hybrid_prefill
+             COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py
+                     --arch qwen3moe --hybrid-prefill --out ${_hybrid_prefill_model})
+    set_tests_properties(moe_make_tiny_model_hybrid_prefill PROPERTIES FIXTURES_SETUP TINY_MOE_HYBRID_PREFILL)
+    add_test(NAME hybrid_gpu_batched_prefill COMMAND bmoe_hybrid_prefill_gate ${_hybrid_prefill_model})
+    set_tests_properties(hybrid_gpu_batched_prefill PROPERTIES
+        FIXTURES_REQUIRED TINY_MOE_HYBRID_PREFILL SKIP_RETURN_CODE 77 LABELS gpu)
 endif()
 
 # arch → (fixture id, gguf filename). Each gets a generate fixture + a gate run.

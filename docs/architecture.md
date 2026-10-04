@@ -24,7 +24,8 @@ core/
                 file_reader — pooled positioned reader, per-consumer O_DIRECT
                 mapping_release - releases the model file's mapping after load (--release-mmap)
     moe/        gguf_offsets (tensor → (shard, offset), split ggufs included), arch_registry,
-                expert_stream_source (one reader per shard), router_hook
+                expert_stream_source (one reader per shard), prefill_cache_policy (RAM retention),
+                router_hook
                 dense_weights — non-expert weight policy + the residency sensor
                 row_stream - row-gathered tables served from flash (see row-gathered-tables.md)
                 device_arena - two layer slots on a prefill device, filled from flash, whole layers

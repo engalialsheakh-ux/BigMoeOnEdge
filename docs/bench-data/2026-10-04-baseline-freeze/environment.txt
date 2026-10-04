@@ -1,0 +1,15 @@
+Observed on 2026-10-04; facts below are from local WMI, CMake cache, nvcc and nvidia-smi.
+CPU: 13th Gen Intel(R) Core(TM) i7-13650HX; 14 cores, 20 logical processors.
+Installed RAM: one 16 GiB SK Hynix DIMM; module rated 5600 MT/s, configured 4800 MT/s.
+Usable physical RAM reported by Windows: 16,873,545,728 bytes.
+Memory channel mode: unknown (WMI shows one populated ChannelA DIMM, not the active controller mode).
+GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU; 6144 MiB dedicated VRAM.
+NVIDIA driver: 581.86.
+CUDA toolkit: 13.4 (nvcc V13.4.59); runtime library version: unknown.
+Windows: Microsoft Windows 11 Pro, version 10.0.26100, build 26100.
+BIOS version: NECN47WW.
+CMake: 4.4.3; generator: Visual Studio 18 2026, x64.
+Compiler: MSVC 19.50.35730.0; toolset directory 14.50.35717.
+NVMe: Micron MTFDKCD512QGN-1BN1AABLA; firmware 1002V8LN.
+Pagefile: C:\pagefile.sys, 6218 MiB allocated and 270 MiB used at query time; size policy unknown.
+Power state during the original full-length reference: unknown.

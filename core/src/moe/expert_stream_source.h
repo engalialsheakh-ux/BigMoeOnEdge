@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -95,6 +96,7 @@ public:
 
     // IExpertSource
     bool load_layer(int il, const int32_t * ids, int n_ids) override;
+    void set_batch_phase(int phase) override;
     void prefetch(int il, const int32_t * ids, int n_ids) override;
     void retain(int il, const int32_t * ids, int n_ids) override;
     void settle_spec() override;
@@ -139,6 +141,9 @@ public:
     void set_io_trace(bool on);
     void take_io_trace_rows(std::vector<IoTraceRow> & out);
 
+    // Eval-thread-only binary demand trace; captures ids after the existing router barrier.
+    bool set_access_trace(const std::string & path);
+
     void shutdown();
 
 private:
@@ -157,7 +162,8 @@ private:
         int32_t expert = -1;
         int16_t layer = -1;
         int8_t proj = -1;
-        uint8_t spec = 0; // 1 if enqueued speculatively by prefetch
+        uint8_t spec = 0;          // 1 if enqueued speculatively by prefetch
+        uint16_t merged_count = 1; // adjacent demand experts covered by this physical read
     };
 
     // One readiness cell per (projection, expert). A cell is "ready for the layer in flight"
@@ -169,6 +175,7 @@ private:
 
     // `j` carries the read AND (for the trace) what it serves; `lane` is who is doing it.
     bool read_slice(int lane, const IoJob & j);
+    void coalesce_jobs(size_t first);
     void io_drain(int lane, uint64_t my_gen);
     void io_worker(int lane);
 
@@ -218,6 +225,20 @@ private:
     void lru_push_back(int32_t id);
     size_t entry_bytes(int il) const;
     void evict_tail();
+    void evict_entry(int32_t id);
+    void configure_prefill_budget();
+    void plan_prefill_layer(int il, const int32_t * ids, int n_ids);
+    void evict_prefill_excess(size_t incoming_bytes);
+    bool write_access_trace(int il,
+                            const int32_t * ids,
+                            int n_ids,
+                            long long lookups_before,
+                            long long hits_before,
+                            long long rereads_before,
+                            long long evictions_before);
+
+    std::FILE * access_trace_ = nullptr;
+    std::vector<char> access_trace_buffer_;
 
     // I/O trace buffer. Its own leaf mutex, never held across a read: the lanes append
     // concurrently, and the eval thread swaps the buffer out between decodes.
@@ -228,7 +249,8 @@ private:
     bool active_ = false;
     bool load_all_ = false;
     bool overlap_ = false;
-    bool two_wave_ = false;                  // publish the first projection's jobs before committing the rest (#118)
+    bool two_wave_ = false; // publish the first projection's jobs before committing the rest (#118)
+    bool coalesce_ = false;
     bool prefetch_sync_ = false;             // test only: drain prefetch reads synchronously (serial mode)
     bool spec_adopt_ = false;                // route-ahead: staged layers adopt committed spec reads (see quiesce_spec)
     std::vector<int32_t> spec_adopt_ids_;    // scratch: the loading layer's pending spec entries
@@ -262,6 +284,10 @@ private:
     // shards, settled at init before any worker thread exists and reported verbatim by stats(). The
     // run-level o_direct fact: what the platform served, not what the flag asked for.
     bool effective_direct_ = false;
+    std::atomic<uint64_t> demand_logical_bytes_{0};
+    std::atomic<uint64_t> demand_physical_bytes_{0};
+    std::atomic<uint64_t> demand_read_windows_{0};
+    std::atomic<uint64_t> demand_merged_ranges_{0};
 
     std::vector<LayerExperts> layers_;
 
@@ -315,6 +341,18 @@ private:
     uint32_t cgen_ = 0;
     size_t cresident_ = 0;
     long long chits_ = 0, clookups_ = 0;
+    bool prefill_phase_ = false;
+    size_t prefill_headroom_ = 0;
+    size_t prefill_retained_bytes_ = 0;
+    size_t prefill_transient_peak_ = 0;
+    size_t prefill_cache_peak_ = 0;
+    std::vector<size_t> prefill_quota_;
+    std::vector<uint8_t> prefill_retained_;
+    std::vector<uint8_t> prefill_demand_;
+    std::vector<uint8_t> prefill_prior_;
+    std::vector<int> prefill_freq_, prefill_last_, prefill_ranked_;
+    long long prefill_hits_ = 0, prefill_lookups_ = 0, prefill_retained_hits_ = 0;
+    long long prefill_transient_loads_ = 0, prefill_rereads_ = 0;
 
     // ── speculative prefetch queue (all fields guarded by io_mtx_) ──
     // prefetch() (eval thread) commits pages and enqueues per-projection reads tagged with the

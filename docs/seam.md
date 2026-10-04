@@ -1,8 +1,9 @@
 # The seam: how we hook llama.cpp without forking it
 
-Everything that connects BigMoeOnEdge to llama.cpp goes through two public mechanisms.
-This file documents the exact contract so it can be re-verified when the submodule is
-updated.
+The serial streamer connects to llama.cpp through two public mechanisms. Optional
+overlap and mixed CPU/CUDA expert execution use the pinned fork extensions below;
+quantized CUDA FlashAttention is a backend change in the same fork. This file
+documents the contracts so they can be re-verified when the submodule is updated.
 
 ## 1. The eval-callback
 
@@ -88,12 +89,12 @@ whole project still compiles and runs — the serial streaming path is unchanged
 falling back.
 
 **Sunset condition.** The released fork carries this hook until upstream exposes an
-equivalent per-expert readiness callback. The GPU expert-cache work below is an additional
-opt-in local fork delta and must be reviewed before any submodule bump.
+equivalent per-expert readiness callback. The pinned mixed expert-cache extension below
+is an additional opt-in fork delta and must be reviewed before any submodule bump.
 
 ## Experimental mixed CPU/CUDA expert cache
 
-The local GPU-cache worktree extends the pinned `ggml-cpu.c` `MUL_MAT_ID` kernel with an
+The pinned GPU-cache fork revision extends the `ggml-cpu.c` `MUL_MAT_ID` kernel with an
 optional `src[3]` I32 table indexed by original expert ID. `op_params[0]` gives the dummy
 GPU slot. A routed ID whose table entry differs from that dummy is a GPU hit: thread zero
 zeros the corresponding CPU destination row and omits it from the kernel's expert work
@@ -113,11 +114,19 @@ bundle, copied into bounded staging after the token, and publishes the GPU slot 
 after all projections upload. The focused `gpu_expert_mixed` gate covers all miss,
 mixed, all hit, multithreaded CPU execution, and a changing map.
 
-The CUDA fallback `MUL_MAT_ID` sorter in this pinned version assumed each selected
-slot occurred once. Multiple misses share dummy slot zero, so the local CUDA delta
+The CUDA fallback `MUL_MAT_ID` sorter in the prior pin assumed each selected
+slot occurred once. Multiple misses share dummy slot zero, so the fork delta
 retains every occurrence when sorting the rows. The all-miss case in
-`gpu_expert_mixed` catches a regression. All of these changes remain uncommitted in
-the submodule working tree; the parent submodule pin still names the earlier commit.
+`gpu_expert_mixed` catches a regression. The mixed-graph bridge is commit
+`1647b34c3` on the Helldez/llama.cpp fork.
+
+The pinned fork also includes commit `82c26e6a9` on local branch
+`bmoe/exact-quantized-fa-baseline`. It adds eligible Q4_0/Q8_0 CUDA
+FlashAttention tile expansion and dispatch diagnostics. This is a CUDA backend
+implementation change, not a new BigMoeOnEdge API seam. The CUDA operator gates
+and the [baseline freeze](bench-data/2026-10-04-baseline-freeze/README.md) record
+the verified shape and runtime configuration. The fork commit and the parent
+submodule pin are local until separately reviewed for publication.
 
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 

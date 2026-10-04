@@ -3,13 +3,13 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
 namespace bmoe {
 namespace {
 constexpr size_t mib = 1024ull * 1024ull;
-constexpr size_t safety_rail = 768ull * mib;
 
 size_t aligned(size_t n, size_t a) {
     return n + (a - n % a) % a;
@@ -24,10 +24,15 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
                          int budget_mb,
                          int n_expert,
                          const std::vector<LayerExperts> & experts,
-                         std::string & error) {
+                         std::string & error,
+                         int safety_mb) {
     reset();
     if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU || budget_mb <= 0 || n_expert <= 0) {
         error = "GPU expert pool needs a GPU device, a positive budget, and expert metadata";
+        return false;
+    }
+    if (safety_mb < 128) {
+        error = "GPU expert safety rail must be at least 128 MiB";
         return false;
     }
     auto buft = ggml_backend_dev_buffer_type(device);
@@ -110,24 +115,36 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
     }
     size_t free_before = 0, total = 0;
     ggml_backend_dev_memory(device, &free_before, &total);
+    const size_t safety_rail = size_t(safety_mb) * mib;
+    auto memory_report = [&](size_t total_bytes, size_t remaining_bytes, bool allocated) {
+        char report[256];
+        const double remaining_mib = allocated ? double(remaining_bytes) / mib : double(free_before) / mib - budget_mb;
+        std::snprintf(report, sizeof(report),
+                      "total_dedicated_mib=%.1f free_dedicated_mib=%.1f requested_mib=%d safety_mib=%d %s=%.1f",
+                      double(total_bytes) / mib, double(free_before) / mib, budget_mb, safety_mb,
+                      allocated ? "remaining_after_allocation_mib" : "projected_remaining_mib", remaining_mib);
+        return std::string(report);
+    };
     if (!total || free_before < budget || free_before - budget < safety_rail) {
-        error = "insufficient dedicated GPU memory for expert cache and 768 MiB safety rail";
+        error = "insufficient dedicated GPU memory for expert cache and safety rail: " + memory_report(total, 0, false);
         reset();
         return false;
     }
     buffer_ = ggml_backend_buft_alloc_buffer(buft, budget);
     if (!buffer_) {
-        error = "GPU expert cache allocation failed";
+        error = "GPU expert cache allocation failed: " + memory_report(total, 0, false);
         reset();
         return false;
     }
     size_t free_after = 0;
     ggml_backend_dev_memory(device, &free_after, &total);
     if (!total || free_after < safety_rail) {
-        error = "GPU expert allocation left less than the 768 MiB safety rail";
+        error = "GPU expert allocation left less than the configured safety rail: " +
+                memory_report(total, free_after, true);
         reset();
         return false;
     }
+    std::fprintf(stderr, "bmoe-gpu-cache: %s\n", memory_report(total, free_after, true).c_str());
     allocated_bytes_ = ggml_backend_buffer_get_size(buffer_);
     size_t host_bytes = 0;
     for (Layer & layer : layers_) {

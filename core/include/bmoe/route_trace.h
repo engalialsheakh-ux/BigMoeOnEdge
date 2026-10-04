@@ -37,6 +37,7 @@ struct RouteTraceRow {
     int32_t expert = 0;        // the routed expert id — the matrix cell's payload
     float weight = 0.0f;       // final applied routing weight; NaN if the graph exposed none
     uint8_t residency = 0;     // RouteResidency
+    uint8_t gpu_hit = 0;       // selected expert executed from the ready VRAM pool
     uint64_t expert_bytes = 0; // flash bytes this routing reads; 0 unless residency == route_miss
     // Cache-aware dropping (MoeStreamConfig::drop_cold_frac) discarded this routing: the expert was
     // a miss weighted below the threshold, so it was never read and its weight was zeroed. `weight`
@@ -44,6 +45,19 @@ struct RouteTraceRow {
     // chosen, and this flag records what the policy then did with it — but expert_bytes is 0,
     // because a dropped expert costs no read. Always 0 when dropping is off.
     uint8_t dropped = 0;
+};
+
+// Diagnostic cache event associated with the decode step that selected the expert.
+// 'C' means a repeated miss had a resident RAM bundle, 'Q' means staging accepted it,
+// and 'P' means the complete bundle was published for future tokens.
+struct GpuCacheTraceEvent {
+    int turn = 0;
+    int step = 0;
+    int layer = 0;
+    int expert = 0;
+    char kind = 'C';
+    uint64_t bundle_bytes = 0;
+    uint8_t evicted = 0;
 };
 
 // Run-level facts the rows cannot carry. Emitted once, before any row.
@@ -67,6 +81,10 @@ public:
     virtual ~IRouteTraceSink() = default;
     virtual void on_static(const RouteTraceStatic &) = 0;
     virtual void on_rows(const RouteTraceRow * rows, size_t n) = 0;
+    virtual void on_gpu_events(const GpuCacheTraceEvent * events, size_t n) {
+        (void) events;
+        (void) n;
+    }
 };
 
 // A sink that writes `path` as long-format CSV: a `#` preamble carrying the static block, then

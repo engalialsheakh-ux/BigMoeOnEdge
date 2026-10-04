@@ -54,6 +54,42 @@ int main() {
     // Baseline and the pre-existing scalar rules.
     expect_ok("valid minimal config", ok_base());
     {
+        using KvCacheType = RunConfig::GpuConfig::KvCacheType;
+        RunConfig c = ok_base();
+        if (c.gpu.cache_type_k != KvCacheType::F16 || c.gpu.cache_type_v != KvCacheType::F16) {
+            std::printf("[FAIL] omitted KV cache flags must default to F16/F16\n");
+            ++failures;
+        } else {
+            std::printf("[PASS] omitted KV cache flags default to F16/F16\n");
+        }
+        KvCacheType type = KvCacheType::F16;
+        if (!parse_kv_cache_type("q8_0", type) || type != KvCacheType::Q8_0) {
+            std::printf("[FAIL] parse q8_0 KV cache type\n");
+            ++failures;
+        } else {
+            c.gpu.cache_type_k = type;
+            c.gpu.cache_type_v = type;
+            expect_ok("Q8_0 K/V cache config", c);
+        }
+        if (!parse_kv_cache_type("q4_0", type) || type != KvCacheType::Q4_0) {
+            std::printf("[FAIL] parse q4_0 KV cache type\n");
+            ++failures;
+        } else {
+            c.gpu.cache_type_k = type;
+            c.gpu.cache_type_v = type;
+            expect_ok("Q4_0 K/V cache config", c);
+        }
+        const KvCacheType before_invalid = type;
+        if (parse_kv_cache_type("unsupported", type) || type != before_invalid) {
+            std::printf("[FAIL] unsupported KV cache type must be rejected without changing config\n");
+            ++failures;
+        } else {
+            std::printf("[PASS] unsupported KV cache type rejected\n");
+        }
+        c.gpu.cache_type_k = static_cast<KvCacheType>(-1);
+        expect_fail("invalid K cache type config", c);
+    }
+    {
         RunConfig c = ok_base();
         expect_ok("GPU disabled by default", c);
         c.gpu.n_gpu_layers = -1;
@@ -69,6 +105,33 @@ int main() {
     }
     {
         RunConfig c = ok_moe();
+        c.moe.io_coalesce = true;
+        expect_fail("I/O coalescing needs overlap", c);
+        c.moe.overlap = true;
+        expect_ok("I/O coalescing with overlap", c);
+        c.moe.access_trace_path = "trace.access";
+        expect_fail("access trace needs RAM cache", c);
+        c.moe.cache_mb = 2;
+        c.moe.force_cache = true;
+        expect_ok("access trace with RAM cache", c);
+        c.moe.enabled = false;
+        expect_fail("access trace needs streaming", c);
+    }
+    {
+        RunConfig c = ok_moe();
+        if (c.gpu.safety_mb != 768) {
+            std::printf("[FAIL] GPU safety rail must default to 768 MiB\n");
+            ++failures;
+        } else {
+            std::printf("[PASS] GPU safety rail defaults to 768 MiB\n");
+        }
+        c.gpu.safety_mb = 128;
+        expect_ok("minimum GPU safety rail", c);
+        c.gpu.safety_mb = 127;
+        expect_fail("GPU safety rail below minimum", c);
+        c.gpu.safety_mb = -1;
+        expect_fail("negative GPU safety rail", c);
+        c.gpu.safety_mb = 768;
         c.gpu.expert_cache_mb = 512;
         expect_fail("VRAM expert cache needs full GPU placement", c);
         c.gpu.n_gpu_layers = 1;
@@ -79,6 +142,11 @@ int main() {
         expect_fail("VRAM expert cache needs streaming", c);
         c.gpu.expert_cache_mb = -1;
         expect_fail("negative VRAM expert cache budget", c);
+        c.gpu.expert_cache_mb = 0;
+        c.gpu.expert_cache_window = 0;
+        expect_fail("zero VRAM admission window", c);
+        c.gpu.expert_cache_window = 65;
+        expect_fail("oversize VRAM admission window", c);
     }
     {
         RunConfig c = ok_moe();

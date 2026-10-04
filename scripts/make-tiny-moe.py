@@ -24,6 +24,7 @@ Requires: pip install gguf numpy
     python scripts/make-tiny-moe.py --arch qwen3moe --out tiny-moe.gguf
     python scripts/make-tiny-moe.py --arch gemma4   --out tiny-moe-gemma4.gguf
     python scripts/make-tiny-moe.py --arch nemotron_h_moe --out tiny-moe-nemotron_h_moe.gguf
+    python scripts/make-tiny-moe.py --hybrid-prefill --out tiny-moe-hybrid-prefill.gguf
 """
 import argparse
 import numpy as np
@@ -385,7 +386,36 @@ def main():
     ap.add_argument("--out", default="tiny-moe.gguf")
     ap.add_argument("--split-max-tensors", type=int, default=0,
                     help="emit a sharded gguf (N tensors per shard, metadata-only first shard)")
+    ap.add_argument("--hybrid-prefill", action="store_true",
+                    help="small 256-expert/top-8 Qwen fixture for batched CUDA streaming")
+    ap.add_argument("--prefill-cache", action="store_true",
+                    help="four-layer Qwen fixture with a measurable retained pool under a 2 MiB cache")
     args = ap.parse_args()
+
+    if args.hybrid_prefill and args.prefill_cache:
+        raise SystemExit("choose only one prefill fixture variant")
+    if args.prefill_cache:
+        if args.arch != "qwen3moe" or args.split_max_tensors:
+            raise SystemExit("--prefill-cache needs a single-file qwen3moe fixture")
+        global N_FF_EXP
+        N_FF_EXP = 64
+    if args.hybrid_prefill:
+        if args.arch != "qwen3moe" or args.split_max_tensors:
+            raise SystemExit("--hybrid-prefill needs a single-file qwen3moe fixture")
+        # At 33 tokens CUDA's host-weight op-offload threshold is crossed. Two layers
+        # keep the first layer's MoE matmul batched; the final layer emits one token.
+        global N_LAYER, N_EMBD, N_HEAD, N_HEAD_KV, N_EMBD_HEAD, N_EMBD_GQA
+        global N_FF, N_EXPERT, N_EXPERT_USED
+        N_LAYER = 2
+        N_EMBD = 64
+        N_HEAD = 2
+        N_HEAD_KV = 1
+        N_EMBD_HEAD = N_EMBD // N_HEAD
+        N_EMBD_GQA = N_HEAD_KV * N_EMBD_HEAD
+        N_FF = 128
+        N_EXPERT = 256
+        N_EXPERT_USED = 8
+        N_FF_EXP = 64
 
     if args.arch != "qwen3moe" and args.split_max_tensors:
         raise SystemExit("--split-max-tensors is exercised via the qwen3moe fixture only")

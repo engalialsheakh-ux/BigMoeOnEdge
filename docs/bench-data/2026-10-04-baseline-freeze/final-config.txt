@@ -1,0 +1,44 @@
+Reference model on the measurement host:
+D:\LocalAI\Models\Qwen36\Qwen3.6-35B-A3B-Q4_K_M.gguf
+
+Verify model.sha256 and prompt.sha256 before a comparison. The prompt is the exact
+668-block, 300104-byte UTF-8 sequence produced by prompt-recipe.ps1; its recorded
+tokenization is 65507 tokens. The original generation used session mode with a
+64-token request, think=false, clear_kv=true and greedy/default sampling.
+
+Environment variable:
+GGML_CUDA_FATTN_MMA_QUANT=auto
+
+Windows CLI arguments:
+--session
+--model MODEL.gguf
+--n-predict 64
+-c 262144
+-t 6
+--ubatch 64
+--moe-stream
+--dense-weights anon
+--release-mmap
+--require-release-mmap
+--cache-mb 4400
+--cache-ceil-mb 4400
+--io-threads 4
+--overlap
+--io-coalesce
+--n-gpu-layers -1
+--gpu-expert-cache-mb 1500
+--gpu-expert-window 4
+--gpu-safety-mb 128
+--cpu-affinity-mask 0xFFF
+--flash-attn auto
+--cache-type-k q4_0
+--cache-type-v q4_0
+--cuda-fa-telemetry
+--progress
+
+Session request JSON keys: cmd="generate", id=1, prompt=<exact prompt>,
+n_predict=64, think=false, clear_kv=true.
+
+Do not pass --no-kv-offload: this baseline uses CUDA KV and quantized CUDA
+FlashAttention. Do not enable rejected sidecar, prediction, or lossy routing
+experiments when comparing exact inference.

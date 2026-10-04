@@ -34,6 +34,18 @@ bool parse_prefix_cache_mode(const std::string & s, PrefixCacheMode & out) {
     return false;
 }
 
+bool parse_kv_cache_type(const std::string & s, RunConfig::GpuConfig::KvCacheType & out) {
+    if (s == "f16")
+        out = RunConfig::GpuConfig::KvCacheType::F16;
+    else if (s == "q8_0")
+        out = RunConfig::GpuConfig::KvCacheType::Q8_0;
+    else if (s == "q4_0")
+        out = RunConfig::GpuConfig::KvCacheType::Q4_0;
+    else
+        return false;
+    return true;
+}
+
 ValidationResult validate(const RunConfig & cfg) {
     ValidationResult r;
     auto fail = [&](std::string msg) {
@@ -60,8 +72,26 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.gpu.main_gpu < 0) {
         return fail("gpu.main_gpu must be >= 0");
     }
+    auto valid_kv_type = [](RunConfig::GpuConfig::KvCacheType type) {
+        switch (type) {
+        case RunConfig::GpuConfig::KvCacheType::F16:
+        case RunConfig::GpuConfig::KvCacheType::Q8_0:
+        case RunConfig::GpuConfig::KvCacheType::Q4_0:
+            return true;
+        }
+        return false;
+    };
+    if (!valid_kv_type(cfg.gpu.cache_type_k) || !valid_kv_type(cfg.gpu.cache_type_v)) {
+        return fail("gpu.cache_type_k/v must be f16, q8_0, or q4_0");
+    }
     if (cfg.gpu.expert_cache_mb < 0) {
         return fail("gpu.expert_cache_mb must be >= 0");
+    }
+    if (cfg.gpu.safety_mb < 128) {
+        return fail("gpu.safety_mb must be >= 128");
+    }
+    if (cfg.gpu.expert_cache_window < 1 || cfg.gpu.expert_cache_window > 64) {
+        return fail("gpu.expert_cache_window must be in [1,64]");
     }
     if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1)) {
         return fail("gpu.expert_cache_mb requires --moe-stream and --n-gpu-layers -1");
@@ -229,6 +259,12 @@ ValidationResult validate(const RunConfig & cfg) {
     }
     if (cfg.moe.row_stream_mb < 0) {
         return fail("moe.row_stream_mb must be >= 0 (0 = the built-in window)");
+    }
+    if (!cfg.moe.access_trace_path.empty() && (!cfg.moe.enabled || (cfg.moe.cache_mb == 0 && !cfg.moe.cache_auto))) {
+        return fail("moe.access_trace_path requires MoE streaming with a RAM expert cache");
+    }
+    if (cfg.moe.io_coalesce && (!cfg.moe.enabled || !cfg.moe.overlap)) {
+        return fail("moe.io_coalesce requires MoE streaming with overlap");
     }
 
     if (cfg.moe.enabled) {

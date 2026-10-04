@@ -44,7 +44,8 @@ int main() {
     for (int repeat = 0; repeat < 3; ++repeat) {
         bmoe::GpuExpertPool pool;
         std::string error;
-        if (!pool.init(gpu, 1, 3, layers, error) || pool.allocated_bytes() != 1024 * 1024 || pool.capacity() != 1) {
+        if (!pool.init(gpu, 1, 3, layers, error, repeat == 0 ? 128 : 768) || pool.allocated_bytes() != 1024 * 1024 ||
+            pool.capacity() != 1) {
             std::fprintf(stderr, "GPU expert pool allocation failed: %s\n", error.c_str());
             llama_backend_free();
             return 1;

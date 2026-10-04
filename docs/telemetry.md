@@ -1,5 +1,44 @@
 # Telemetry contract
 
+## CUDA FlashAttention dispatch diagnostic
+
+On Windows, `--cuda-fa-telemetry` prints one `bmoe-cuda-fa:` summary on stderr when
+the process exits. It is independent of `--progress`. The summary includes the CUDA
+device and compute capability, the first observed K/V types and head dimension,
+maximum query and KV tensor lengths, counts by vector/MMA/tile implementation,
+the count of vector calls using shared GQA K/V reads,
+and whether F16 K/V scratch was allocated. `max_f16_scratch_bytes` includes
+alignment padding; `max_f16_scratch_used_bytes` excludes it, and
+`f16_dequant_bytes` sums the K/V bytes converted across calls. `max_n_kv` is
+the tensor length seen by the CUDA backend; it
+does not by itself prove how many KV positions were unmasked. The diagnostic
+does not synchronize or time CUDA kernels. If the run uses more than one K/V
+type or head dimension, the first observed values are only representative.
+Call and byte totals count host dispatches. CUDA Graph replay can execute a
+captured kernel without another host dispatch, so these totals may undercount
+GPU executions; maximum scratch and shape fields still describe the captured
+dispatches.
+When the CUDA backend is loaded but runs no FlashAttention kernel, the line
+reports `calls=0` and `K=none V=none`.
+
+Quantized single-query decode on Ampere selects inline-dequant MMA at 4096 or
+more KV positions when its D=256/GQA shape is supported; shorter decode uses
+the direct-reading vector kernel. Eligible Q4_0/Q8_0 batches of 2–64 queries
+with D=256 also select inline-dequant MMA and increment `mma_quant_direct`.
+`mma_quant_direct_decode` and `mma_quant_direct_prefill` split that count by
+single-query and multi-query dispatches.
+That kernel stages the current quantized tile in shared memory, with no F16
+K/V output buffer. Unsupported MMA shapes increment `mma_legacy` and may
+materialize F16 scratch. `GGML_CUDA_FATTN_MMA_QUANT=legacy` disables inline
+dequant for an A/B comparison; `direct` also forces it for eligible
+single-query decode. The default is `auto`. The field names are counts of
+host dispatches, subject to the CUDA Graph caveat above.
+
+For a controlled comparison, set `GGML_CUDA_FATTN_VEC_NCOLS2=1` before starting
+the process to disable GQA sharing while retaining the original vector/MMA
+fallback. Leave it unset for automatic GQA sharing. The override is read once
+by the CUDA backend and does not change the stored K/V values.
+
 With `--progress`, `bmoe-cli` emits machine-readable lines the Android app (and any other
 consumer) parses. The format is versioned by this document; keep it stable.
 
@@ -359,6 +398,15 @@ units as the `BMOE_DONE` keys of those names (see the protocol notes above), app
 existing readers ignore them. A recorded run can now answer "what did the prompt cost, and in
 what" without the protocol line.
 
+The RAM expert cache also reports `prefill_cache_hits`, `prefill_cache_lookups`,
+`prefill_retained_hits`, `prefill_transient_loads`, `prefill_rereads`,
+`prefill_retained_resident_mib`, `prefill_transient_peak_mib`, and `prefill_cache_peak_mib` in the trailer and
+`BMOE_DONE`. The first five count unique expert lookups or loads within this turn's prefill;
+`retained_hits` means an expert protected by its layer's previous prefill hot set was reused.
+The resident value is the protected bytes at the end of prefill; the transient peak is the
+largest unprotected resident portion, and the cache peak is the largest total resident portion
+observed during prefill. They are zero without the RAM expert cache.
+
 With `--prefill-device`, four more: `prefill_dev_tokens=<int>` (prompt tokens whose graph ran on the
 device), `prefill_dev_nodes=<int>` (graph nodes the device actually computed, i.e. whose output
 landed in a device buffer: the proof it ran, where the token count only says the weights were moved),
@@ -411,19 +459,24 @@ per routed expert. **A traced run is not a benchmark run** — the numbers in th
 traced run are slower than the real thing, and `mgmt_ms` in particular shifts, because settling
 speculative prefetch moves outside the window that times it.
 
-Columns are **append-only** within `v1`, like the metrics CSV: `dropped` was added after
-`expert_bytes`, so consumers must read by column NAME and treat any column as optional rather than
-indexing by position.
+Columns are append-only. Version 2 adds `gpu_hit` after the earlier `dropped` column;
+consumers should read by column name and treat new columns as optional. CUDA traces
+leave `weight=nan` when the routing-weight tensor lives on the device; selected IDs,
+RAM residency, and GPU hits are still recorded. Version 3 appends GPU cache events as
+comment rows after the route rows, keeping route CSV consumers that skip `#` lines compatible.
 
 The file is long format: a `#` preamble carrying the run's static facts, then one row per routed
 expert. Conceptually it is a matrix — rows are steps, columns are layers — and a **cell** is the
 `n_expert_used` rows sharing `(turn, phase, step, layer)`.
 
 ```
-# route_trace v1
+# route_trace v3
 # model=<path> arch=<string> n_layer=<int> n_expert=<int> n_expert_used=<int>
 # layer=<int> expert_bytes=<int> dense_bytes=<int>        (one per layer)
-turn,phase,step,layer,slot,expert,weight,residency,expert_bytes,dropped
+turn,phase,step,layer,slot,expert,weight,residency,expert_bytes,dropped,gpu_hit
+...
+# gpu_events: turn,step,layer,expert,kind,bundle_bytes,evicted
+# gpu_event,<turn>,<step>,<layer>,<expert>,<kind>,<bundle_bytes>,<evicted>
 ```
 
 | column | meaning |
@@ -438,6 +491,14 @@ turn,phase,step,layer,slot,expert,weight,residency,expert_bytes,dropped
 | `residency` | `0` = miss (this routing reads from flash), `1` = hit, `2` = hit on a speculative prefetch's first touch. |
 | `expert_bytes` | flash bytes this routing reads; `0` unless `residency=0`. |
 | `dropped` | `1` when [cache-aware dropping](expert-dropping.md) discarded this routing — a miss weighted below the threshold, never read, weight zeroed. Always `0` with `--drop-cold-experts` off. |
+| `gpu_hit` | `1` when a ready VRAM expert slot executes this routing on CUDA; `0` for the CPU miss path or when the GPU expert cache is off. |
+
+GPU event `C` means a repeated VRAM miss was eligible for admission and its exact bundle was
+resident in the RAM cache; `Q` means bounded staging accepted it; `P` means the background
+worker published the complete bundle for future tokens. `evicted=1` on `P` means its slot
+reservation displaced a ready bundle. `bundle_bytes` is the exact gate/up/down upload size.
+The event's `step` is the routing step that proposed the promotion, even if publication
+completed during a later token. Events are written when the session closes.
 
 `(turn, phase, step, layer, slot)` is unique. Two asymmetries are deliberate:
 
@@ -524,6 +585,10 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
             "prefill_cpu_s":<float>,"prefill_read_mib":<float>,"prefill_io_s":<float>,
             "prefill_stall_s":<float>,"prefill_mgmt_s":<float>,
+            "prefill_cache_hits":<int>,"prefill_cache_lookups":<int>,"prefill_retained_hits":<int>,
+            "prefill_transient_loads":<int>,"prefill_rereads":<int>,
+            "prefill_retained_resident_mib":<float>,"prefill_transient_peak_mib":<float>,
+            "prefill_cache_peak_mib":<float>,
             "prefill_dev_tokens":<int>,"prefill_dev_nodes":<int>,"prefill_dev_read_mib":<float>,
             "prefill_dev_stall_s":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
@@ -669,8 +734,10 @@ extra); those rows carry the same `blk.<il>` name and simply sum into their laye
 
 ### `--io-trace` — one row per flash read
 
-Needs `--moe-stream` (no engine-issued reads without it). Records every `pread` the streamer
-issues, tagged with the `(layer, expert, projection)` it serves.
+Needs `--moe-stream` (no engine-issued reads without it). Records each expert read window the
+streamer submits, tagged with its `(layer, expert, projection)`. With `--io-coalesce`, `expert`
+is the first expert in an adjacent group and `req_bytes` covers the complete group, so one row
+can serve several experts. The file offset and slice size identify the full span.
 
 ```
 # io_trace v1
@@ -683,6 +750,11 @@ gap is O_DIRECT alignment waste, and `read_bytes` is what effective bandwidth mu
 against. `spec=1` marks a speculative prefetch read. Rows are stamped with the decode they were
 drained after, so a read straddling a token boundary is attributed to the decode that flushed it.
 
+With `--io-coalesce`, teardown also prints `bmoe-io-coalesce:` to stderr. `logical_mib` sums
+demand expert slices, `physical_mib` sums the aligned bytes actually read, `read_windows` counts
+the merged FileReader requests, `merged_ranges` counts how many individual slice requests were
+absorbed, and `overread_mib` is physical minus logical MiB. Speculative reads are excluded.
+
 ### VRAM expert-cache diagnostic
 
 When `--gpu-expert-cache-mb` is positive, session teardown prints one
@@ -691,8 +763,9 @@ count selected expert contributions, including the initial all-miss token;
 their sum should equal the routed top-k count across generated tokens.
 `gpu_promotions` counts complete bundles published for later tokens,
 `gpu_evictions` counts displaced ready slots, and `gpu_cache_resident` is the
-number of ready bundles at teardown. `gpu_upload_mib` and `gpu_upload_ms`
-measure the bytes and wall time spent by the bounded background uploader.
+number of ready bundles at teardown. `gpu_upload_mib`, `gpu_upload_ms`, and
+`gpu_upload_calls` measure the bytes, wall time, and projection-copy calls of
+the bounded background uploader.
 These counters do not change the CSV schemas or the `BMOE_*` protocol.
 
 ### Reading them

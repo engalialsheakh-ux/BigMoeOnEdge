@@ -27,6 +27,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -37,6 +38,7 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #endif
 
@@ -435,6 +437,10 @@ static int run_session_loop(const RunConfig & cfg,
                     "\"read_mib\":%.1f,\"stall_s_tok\":%.4f,\"mgmt_s_tok\":%.4f,\"majflt_tok\":%.2f,\"cpu_s_tok\":%.4f,"
                     "\"prefill_cpu_s\":%.3f,\"prefill_read_mib\":%.1f,\"prefill_io_s\":%.3f,"
                     "\"prefill_stall_s\":%.3f,\"prefill_mgmt_s\":%.3f,"
+                    "\"prefill_cache_hits\":%lld,\"prefill_cache_lookups\":%lld,\"prefill_retained_hits\":%lld,"
+                    "\"prefill_transient_loads\":%lld,\"prefill_rereads\":%lld,"
+                    "\"prefill_retained_resident_mib\":%.1f,\"prefill_transient_peak_mib\":%.1f,"
+                    "\"prefill_cache_peak_mib\":%.1f,"
                     "\"prefill_dev_tokens\":%d,\"prefill_dev_nodes\":%lld,\"prefill_dev_read_mib\":%.1f,"
                     "\"prefill_dev_stall_s\":%.3f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
@@ -445,11 +451,13 @@ static int run_session_loop(const RunConfig & cfg,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
                     s.cache_budget_mib, s.moe_read_mib, s.moe_stall_s_per_token, s.moe_mgmt_s_per_token,
                     s.majflt_per_token, s.cpu_s_per_token, s.prefill_cpu_seconds, s.prefill_read_mib,
-                    s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.prefill_device_tokens,
-                    s.prefill_device_nodes, s.prefill_device_read_mib, s.prefill_device_stall_seconds,
-                    s.token_demand_mib, s.mtp_drafted, s.mtp_accepted, s.mtp_decodes, s.mtp_draft_s_per_token,
-                    s.drafted_steps, s.loop_overhead_s_per_token, json_escape(r.reasoning_text).c_str(),
-                    json_escape(r.generated_text).c_str());
+                    s.prefill_io_seconds, s.prefill_stall_seconds, s.prefill_mgmt_seconds, s.prefill_cache_hits,
+                    s.prefill_cache_lookups, s.prefill_retained_hits, s.prefill_transient_loads, s.prefill_rereads,
+                    s.prefill_retained_resident_mib, s.prefill_transient_peak_mib, s.prefill_cache_peak_mib,
+                    s.prefill_device_tokens, s.prefill_device_nodes, s.prefill_device_read_mib,
+                    s.prefill_device_stall_seconds, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted, s.mtp_decodes,
+                    s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
+                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
         std::fflush(stdout);
     }
 
@@ -530,9 +538,17 @@ static void print_usage(const char * argv0) {
         "      --n-gpu-layers N    CUDA layers: 0=CPU (default), -1=all eligible, N=partial\n"
         "      --main-gpu N        CUDA device index (default 0)\n"
         "      --gpu-expert-cache-mb N  reserve N MiB of dedicated VRAM for expert slots (default 0)\n"
+        "      --expert-access-trace PATH  record exact expert demands for offline cache replay\n"
+        "      --io-coalesce      merge adjacent expert slices into bounded demand reads\n"
+        "      --gpu-safety-mb N   retain at least N MiB of dedicated VRAM (min 128, default 768)\n"
         "      --gpu-expert-no-promote  keep the VRAM pool empty for an all-miss correctness probe\n"
+        "      --gpu-expert-window N  admit an expert reused within N decode tokens (default 8)\n"
         "      --no-kv-offload     keep KV and KQV operations on CPU\n"
+        "      --cache-type-k T    KV key cache: f16 (default) | q8_0 | q4_0\n"
+        "      --cache-type-v T    KV value cache: f16 (default) | q8_0 | q4_0\n"
         "      --flash-attn M      auto (default) | on | off\n"
+        "      --cuda-fa-telemetry  summarize CUDA FlashAttention dispatch and F16 scratch\n"
+        "      --cpu-affinity-mask MASK  Windows process CPU affinity, decimal or 0x hex\n"
         "  -h, --help              show this text and exit\n"
         "      --version           print the engine version and exit\n"
         "\n"
@@ -724,6 +740,8 @@ int main(int argc, char ** argv) {
     std::string compute_trace_path;
     std::string io_trace_path;
     bool session_mode = false;
+    bool cuda_fa_telemetry = false;
+    unsigned long long cpu_affinity_mask = 0;
 
     // Which flags the user actually typed. The env overrides below consult this rather than
     // comparing against the default, so passing a flag its default value still wins.
@@ -782,11 +800,39 @@ int main(int argc, char ** argv) {
             cfg.gpu.main_gpu = gpu_int(a.c_str());
         else if (a == "--gpu-expert-cache-mb")
             cfg.gpu.expert_cache_mb = gpu_int(a.c_str());
+        else if (a == "--expert-access-trace")
+            cfg.moe.access_trace_path = next(a.c_str());
+        else if (a == "--io-coalesce")
+            cfg.moe.io_coalesce = true;
+        else if (a == "--gpu-safety-mb")
+            cfg.gpu.safety_mb = gpu_int(a.c_str());
         else if (a == "--gpu-expert-no-promote")
             cfg.gpu.expert_cache_promote = false;
-        else if (a == "--no-kv-offload")
+        else if (a == "--gpu-expert-window")
+            cfg.gpu.expert_cache_window = gpu_int(a.c_str());
+        else if (a == "--cpu-affinity-mask") {
+            const char * value = next("--cpu-affinity-mask");
+            char * end = nullptr;
+            errno = 0;
+            cpu_affinity_mask = std::strtoull(value, &end, 0);
+            if (errno == ERANGE || end == value || *end != '\0' || cpu_affinity_mask == 0) {
+                std::fprintf(stderr, "bmoe: --cpu-affinity-mask expects a nonzero decimal or 0x hex mask\n");
+                return 2;
+            }
+        } else if (a == "--no-kv-offload")
             cfg.gpu.kv_offload = false;
-        else if (a == "--flash-attn") {
+        else if (a == "--cache-type-k" || a == "--cache-type-v") {
+            const char * value = next(a.c_str());
+            RunConfig::GpuConfig::KvCacheType type;
+            if (!parse_kv_cache_type(value, type)) {
+                std::fprintf(stderr, "bmoe: config error: %s expects f16|q8_0|q4_0, got '%s'\n", a.c_str(), value);
+                return 2;
+            }
+            if (a == "--cache-type-k")
+                cfg.gpu.cache_type_k = type;
+            else
+                cfg.gpu.cache_type_v = type;
+        } else if (a == "--flash-attn") {
             const std::string mode = next("--flash-attn");
             if (mode == "auto")
                 cfg.gpu.flash_attn = RunConfig::GpuConfig::FlashAttention::Auto;
@@ -798,7 +844,9 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "bmoe: --flash-attn expects auto|on|off, got '%s'\n", mode.c_str());
                 return 2;
             }
-        } else if (a == "--temp")
+        } else if (a == "--cuda-fa-telemetry")
+            cuda_fa_telemetry = true;
+        else if (a == "--temp")
             cfg.sampling.temp = (float) std::atof(next("--temp"));
         else if (a == "--top-k")
             cfg.sampling.top_k = std::atoi(next("--top-k"));
@@ -996,6 +1044,31 @@ int main(int argc, char ** argv) {
     if (!vr) {
         std::fprintf(stderr, "config error: %s\n", vr.error.c_str());
         return 1;
+    }
+    if (cuda_fa_telemetry) {
+#if defined(_WIN32)
+        if (_putenv_s("GGML_CUDA_FA_TELEMETRY", "1") != 0) {
+#else
+        if (setenv("GGML_CUDA_FA_TELEMETRY", "1", 1) != 0) {
+#endif
+            std::fprintf(stderr, "bmoe: could not enable CUDA FlashAttention telemetry\n");
+            return 2;
+        }
+    }
+    if (cpu_affinity_mask) {
+#if defined(_WIN32)
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        if (cpu_affinity_mask > static_cast<unsigned long long>(std::numeric_limits<DWORD_PTR>::max()) ||
+            !GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) ||
+            (static_cast<DWORD_PTR>(cpu_affinity_mask) & system_mask) != cpu_affinity_mask ||
+            !SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(cpu_affinity_mask))) {
+            std::fprintf(stderr, "bmoe: requested CPU affinity is unavailable on this Windows process\n");
+            return 2;
+        }
+#else
+        std::fprintf(stderr, "bmoe: --cpu-affinity-mask is supported only on Windows\n");
+        return 2;
+#endif
     }
     // Decide requests only travel through the session protocol; a one-shot run would ignore the flag.
     if (cfg.decide.enabled && !session_mode) {
