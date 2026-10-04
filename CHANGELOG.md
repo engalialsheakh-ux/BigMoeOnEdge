@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.32.0] - 2026-10-04
+
+### Added
+- Add an opt-in Qwen3.5 MoE layer-tiled prompt path on Windows CUDA with
+  `--prefill-layer-tile 512`: 512-token logical tiles execute as 64-token
+  physical graphs, reusing the existing streamed expert cache across each
+  layer. Ordinary prefill and one-token decode retain their default paths.
+- Add a tiny hybrid state/output gate for layer-tiled execution and record the
+  measured short Qwen3.6 result and the bounded transaction design.
+
+### Changed
+- Extend the local llama.cpp seam with layer-range graph construction and
+  one-time hybrid memory descriptor preparation. A tiled execution error
+  invalidates the context rather than resuming from partial state.
+
 ## [0.31.0] - 2026-10-02
 
 ### Added

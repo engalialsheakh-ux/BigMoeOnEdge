@@ -368,6 +368,21 @@ int main() {
         expect_fail("a negative n_ubatch is rejected", c);
     }
 
+    // Layer tiles keep the physical graph at the verified width and require the hybrid CUDA path.
+    {
+        RunConfig c = ok_moe();
+        c.n_ctx = 1024;
+        c.n_ubatch = 64;
+        c.gpu.n_gpu_layers = -1;
+        c.layer_tile_tokens = 512;
+        expect_ok("layer-tiled prefill with 64-token CUDA graphs", c);
+        c.n_ubatch = 128;
+        expect_fail("layer-tiled prefill rejects physical width 128", c);
+        c.n_ubatch = 64;
+        c.layer_tile_tokens = -1;
+        expect_fail("layer-tiled prefill rejects negative tile size", c);
+    }
+
     // Speculation: lossless only under greedy, and the draft width is bounded on both sides.
     // These rules are shared by every draft source, so they are checked against the MTP one.
     {

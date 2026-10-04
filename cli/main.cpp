@@ -504,6 +504,7 @@ static void print_usage(const char * argv0) {
         "                          through a two-layer arena. Not with speculation or --row-stream.\n"
         "                          Off.\n"
         "      --prefill-min-tokens N  narrowest prefill piece sent to that device (default 32)\n"
+        "      --prefill-layer-tile 512  experimental Qwen3.5 MoE layer-tiled prefill (requires --ubatch 64)\n"
         "      --prefill-loaders N  threads that fill the device's layer slots from flash, with\n"
         "                          --moe-stream (1..16, default 8). Decode read lanes stay\n"
         "                          --io-threads.\n"
@@ -782,6 +783,8 @@ int main(int argc, char ** argv) {
             cfg.n_ubatch = std::atoi(next("--ubatch"));
         else if (a == "--prefill-device")
             cfg.prefill.device = next("--prefill-device");
+        else if (a == "--prefill-layer-tile")
+            cfg.layer_tile_tokens = gpu_int("--prefill-layer-tile");
         else if (a == "--prefill-routed")
             cfg.prefill.routed = true;
         else if (a == "--no-prefill-routed")

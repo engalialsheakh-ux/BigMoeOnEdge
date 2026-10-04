@@ -163,6 +163,77 @@ def build_qwen3moe(out, split_max_tensors=0):
           f"(top-{N_EXPERT_USED}), vocab {n_vocab}")
 
 
+def build_qwen35moe(out):
+    tokens, scores, toktypes = build_vocab()
+    n_vocab = len(tokens)
+    w = gguf.GGUFWriter(out, "qwen35moe")
+    w.add_name("tiny-qwen35moe")
+    w.add_context_length(1024)
+    w.add_embedding_length(N_EMBD)
+    w.add_block_count(N_LAYER)
+    w.add_feed_forward_length(N_FF)
+    w.add_head_count(N_HEAD)
+    w.add_head_count_kv(N_HEAD_KV)
+    w.add_key_length(N_EMBD_HEAD)
+    w.add_value_length(N_EMBD_HEAD)
+    w.add_rope_dimension_count(32)
+    w.add_rope_dimension_sections([8, 8, 0, 0])
+    w.add_rope_freq_base(ROPE_BASE)
+    w.add_layer_norm_rms_eps(RMS_EPS)
+    w.add_expert_count(N_EXPERT)
+    w.add_expert_used_count(N_EXPERT_USED)
+    w.add_expert_feed_forward_length(N_FF_EXP)
+    w.add_expert_shared_feed_forward_length(N_FF_EXP)
+    w.add_ssm_conv_kernel(4)
+    w.add_ssm_inner_size(64)
+    w.add_ssm_state_size(16)
+    w.add_ssm_time_step_rank(4)
+    w.add_ssm_group_count(2)
+    w.add_full_attention_interval(4)
+    w.add_file_type(gguf.LlamaFileType.ALL_F32)
+    add_tokenizer(w, tokens, scores, toktypes)
+
+    w.add_tensor("token_embd.weight", rnd(n_vocab, N_EMBD, seed=1))
+    w.add_tensor("output_norm.weight", rnd(N_EMBD, seed=2))
+    w.add_tensor("output.weight", rnd(n_vocab, N_EMBD, seed=3))
+    for i in range(N_LAYER):
+        p = f"blk.{i}."
+        s = 100 + i * 100
+        w.add_tensor(p + "attn_norm.weight", rnd(N_EMBD, seed=s))
+        w.add_tensor(p + "post_attention_norm.weight", rnd(N_EMBD, seed=s + 1))
+        if i % 4 == 3:
+            w.add_tensor(p + "attn_q.weight", rnd(2 * N_HEAD * N_EMBD_HEAD, N_EMBD, seed=s + 2))
+            w.add_tensor(p + "attn_k.weight", rnd(N_EMBD_GQA, N_EMBD, seed=s + 3))
+            w.add_tensor(p + "attn_v.weight", rnd(N_EMBD_GQA, N_EMBD, seed=s + 4))
+            w.add_tensor(p + "attn_output.weight", rnd(N_EMBD, N_HEAD * N_EMBD_HEAD, seed=s + 5))
+            w.add_tensor(p + "attn_q_norm.weight", rnd(N_EMBD_HEAD, seed=s + 6))
+            w.add_tensor(p + "attn_k_norm.weight", rnd(N_EMBD_HEAD, seed=s + 7))
+        else:
+            w.add_tensor(p + "attn_qkv.weight", rnd(128, N_EMBD, seed=s + 2))
+            w.add_tensor(p + "attn_gate.weight", rnd(64, N_EMBD, seed=s + 3))
+            w.add_tensor(p + "ssm_conv1d.weight", rnd(128, 4, seed=s + 4))
+            w.add_tensor(p + "ssm_dt.bias", rnd(4, seed=s + 5))
+            w.add_tensor(p + "ssm_a", rnd(4, seed=s + 6))
+            w.add_tensor(p + "ssm_beta.weight", rnd(4, N_EMBD, seed=s + 7))
+            w.add_tensor(p + "ssm_alpha.weight", rnd(4, N_EMBD, seed=s + 8))
+            w.add_tensor(p + "ssm_norm.weight", rnd(16, seed=s + 9))
+            w.add_tensor(p + "ssm_out.weight", rnd(N_EMBD, 64, seed=s + 10))
+        w.add_tensor(p + "ffn_gate_inp.weight", rnd(N_EXPERT, N_EMBD, seed=s + 11))
+        w.add_tensor(p + "ffn_gate_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD, seed=s + 12))
+        w.add_tensor(p + "ffn_up_exps.weight", rnd(N_EXPERT, N_FF_EXP, N_EMBD, seed=s + 13))
+        w.add_tensor(p + "ffn_down_exps.weight", rnd(N_EXPERT, N_EMBD, N_FF_EXP, seed=s + 14))
+        w.add_tensor(p + "ffn_gate_inp_shexp.weight", rnd(N_EMBD, seed=s + 15))
+        w.add_tensor(p + "ffn_gate_shexp.weight", rnd(N_FF_EXP, N_EMBD, seed=s + 16))
+        w.add_tensor(p + "ffn_up_shexp.weight", rnd(N_FF_EXP, N_EMBD, seed=s + 17))
+        w.add_tensor(p + "ffn_down_shexp.weight", rnd(N_EMBD, N_FF_EXP, seed=s + 18))
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    print(f"wrote {out}: qwen35moe hybrid, {N_LAYER} layers")
+
+
 # --- gemma4: fused gate+up layout --------------------------------------------------
 # Gemma 4 MoE packs gate+up into one expert tensor (ffn_gate_up_exps) and keeps an
 # always-on shared expert (the layer's dense ffn_{gate,up,down}). We interleave one dense
@@ -382,7 +453,7 @@ def build_nemotron_h_moe(out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["qwen3moe", "gemma4", "nemotron_h_moe"], default="qwen3moe")
+    ap.add_argument("--arch", choices=["qwen3moe", "qwen35moe", "gemma4", "nemotron_h_moe"], default="qwen3moe")
     ap.add_argument("--out", default="tiny-moe.gguf")
     ap.add_argument("--split-max-tensors", type=int, default=0,
                     help="emit a sharded gguf (N tensors per shard, metadata-only first shard)")
@@ -421,6 +492,8 @@ def main():
         raise SystemExit("--split-max-tensors is exercised via the qwen3moe fixture only")
     if args.arch == "gemma4":
         build_gemma4(args.out)
+    elif args.arch == "qwen35moe":
+        build_qwen35moe(args.out)
     elif args.arch == "nemotron_h_moe":
         build_nemotron_h_moe(args.out)
     else:

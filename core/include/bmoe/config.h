@@ -461,8 +461,9 @@ struct RunConfig {
     // Decode is unaffected: a decode graph is one token wide whatever this says. The cost is
     // prefill throughput, which processes a long prompt in more, smaller passes.
     int n_ubatch = 0;
-    bool chatml = false;   // wrap the prompt in the model family's chat turn (arch-aware)
-    bool progress = false; // emit machine telemetry (one JSON line per token)
+    int layer_tile_tokens = 0; // experimental Qwen3.5 MoE prefill; 0 disables, 512 selects eight 64-token graphs
+    bool chatml = false;       // wrap the prompt in the model family's chat turn (arch-aware)
+    bool progress = false;     // emit machine telemetry (one JSON line per token)
 
     // Render the chat template with reasoning enabled. Passed to the template as the
     // `enable_thinking` kwarg, so a reasoning model (Qwen3, thinking Gemma, …) only emits

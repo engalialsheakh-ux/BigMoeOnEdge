@@ -128,6 +128,24 @@ and the [baseline freeze](bench-data/2026-10-04-baseline-freeze/README.md) recor
 the verified shape and runtime configuration. The fork commit and the parent
 submodule pin are local until separately reviewed for publication.
 
+### Experimental layer-tiled prefill seam
+
+The local `bmoe/cuda-wide-prefill` fork commit
+`eac6c3a20f896c436e48d4a560ff35e6101bce9c` adds one opt-in entry point,
+`llama_decode_layer_tiled`, for Qwen3.5 MoE hybrid prompt prefill.
+It passes `[layer_start, layer_end)` through the graph parameters and reuse key,
+feeds intermediate hidden states into later layer graphs, and exposes only
+final-layer logits. Hybrid memory contexts retain a small descriptor per
+physical microbatch: resolved attention `n_kv`, the existing KV cell/sequence
+mapping and positions, and recurrent `n_rs`, `head`, `rs_z`, and copy-source
+slots. Each microbatch applies state once; later layer ranges replay the
+descriptor without another state mutation. The normal `llama_decode` and
+full-range graph remain the default. The tiled transaction invalidates the
+context on execution failure; callers must reopen the session. See the
+[transaction design](bench-data/2026-10-04-cuda-wide-prefill/layer-tile-design.md)
+and the synthetic/real-model gates before reviewing or publishing this fork
+delta. The parent milestone pins the local commit; no public branch has moved.
+
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 
 Separate from the two streaming hooks above, `session.cpp` links llama.cpp's `common`

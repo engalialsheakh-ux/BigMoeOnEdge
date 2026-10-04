@@ -18,6 +18,8 @@ add_executable(bmoe_hybrid_gpu_gate hybrid_gpu_gate.cpp)
 target_link_libraries(bmoe_hybrid_gpu_gate PRIVATE bmoe_core)
 add_executable(bmoe_hybrid_prefill_gate hybrid_prefill_gate.cpp)
 target_link_libraries(bmoe_hybrid_prefill_gate PRIVATE bmoe_core)
+add_executable(bmoe_layer_tile_gate layer_tile_gate.cpp)
+target_link_libraries(bmoe_layer_tile_gate PRIVATE bmoe_core)
 add_executable(bmoe_gpu_expert_pool_test gpu_expert_pool_test.cpp)
 target_link_libraries(bmoe_gpu_expert_pool_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
@@ -124,7 +126,7 @@ target_include_directories(bmoe_decide_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src
 add_test(NAME decide_policy COMMAND bmoe_decide_test)
 
 foreach(_test_target IN ITEMS
-        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_hybrid_prefill_gate bmoe_prefill_cache_gate
+        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_hybrid_prefill_gate bmoe_layer_tile_gate bmoe_prefill_cache_gate
         bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
         bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test
         bmoe_cpu_expert_skip_test
@@ -147,6 +149,14 @@ if(NOT _python_deps_result EQUAL 0)
     message(FATAL_ERROR "MoE fixture tests require gguf and numpy in ${Python3_EXECUTABLE}. "
         "Install with: py -m pip install gguf numpy\n${_python_deps_error}")
 endif()
+
+set(_layer_tile_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35moe.gguf")
+add_test(NAME moe_make_tiny_model_layer_tile
+         COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py
+                 --arch qwen35moe --out ${_layer_tile_model})
+set_tests_properties(moe_make_tiny_model_layer_tile PROPERTIES FIXTURES_SETUP TINY_QWEN35MOE)
+add_test(NAME layer_tile_gate COMMAND bmoe_layer_tile_gate ${_layer_tile_model})
+set_tests_properties(layer_tile_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE)
 
 set(_prefill_cache_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-prefill-cache.gguf")
 add_test(NAME moe_make_tiny_model_prefill_cache

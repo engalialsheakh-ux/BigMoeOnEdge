@@ -42,6 +42,7 @@ struct SessionConfig {
     // throughput for resident compute buffers, which on this engine compete with the expert cache.
     // See RunConfig::n_ubatch.
     int n_ubatch = 0;
+    int layer_tile_tokens = 0;
     bool chatml = false;
     // Active-expert (top-k) override applied at load via a kv_override on the arch-prefixed
     // expert_used_count key. 0 = use the model's own count. See RunConfig::n_expert_used.

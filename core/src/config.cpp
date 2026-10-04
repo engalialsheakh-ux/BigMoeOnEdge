@@ -115,6 +115,12 @@ ValidationResult validate(const RunConfig & cfg) {
         return fail("n_ubatch=" + std::to_string(cfg.n_ubatch) + " exceeds n_ctx=" + std::to_string(cfg.n_ctx) +
                     ": the compute buffers would be reserved for a batch that cannot occur.");
     }
+    if (cfg.layer_tile_tokens != 0 &&
+        (cfg.layer_tile_tokens != 512 || cfg.n_ubatch != 64 || cfg.n_ctx < 512 || cfg.spec.enabled() ||
+         cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled)) {
+        return fail("prefill.layer_tile_tokens requires 512-token tiles, --ubatch 64, --moe-stream, full CUDA "
+                    "placement, and no speculation or prefill device");
+    }
     // Lower bound only: 0 means "use the model default". The upper bound (<= the model's
     // real expert count) needs the loaded gguf, so it is deferred to run() where the model
     // is available — same rationale as the streaming checks that stay out of this pure path.

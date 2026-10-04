@@ -3,9 +3,10 @@
 BigMoeOnEdge is a small ports-and-adapters engine that sits **on top of** llama.cpp's
 public API. Its guiding constraint: drive streaming through the public API so upstream
 updates cost a submodule pointer bump and nothing else. The serial streamer holds to this
-against stock upstream; the one exception is the optional `--overlap` feature, which carries
-a single ~25-line hook on a fork branch with an explicit sunset (see below and
-[seam.md § 3](seam.md)).
+against stock upstream. Optional CUDA expert-cache and layer-tiled prefill paths use narrow
+extensions in the pinned fork; the latter supplies layer-range graphs and reusable hybrid
+memory descriptors. Both remain opt-in (see [seam.md](seam.md) and
+[cuda-hybrid.md](cuda-hybrid.md)).
 
 ## Layers
 

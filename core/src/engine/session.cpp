@@ -413,10 +413,13 @@ struct Session::Impl {
                    ? -1
                    : result;
     }
-    int decode_placed(llama_context * c, const llama_batch & b) {
+    int decode_placed(llama_context * c, const llama_batch & b, bool layer_tiled = false) {
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
-        const int result = prefill ? prefill->decode(c, b) : llama_decode(c, b);
+        const int result = layer_tiled && b.n_tokens > cfg.n_ubatch
+                               ? llama_decode_layer_tiled(c, b, (uint32_t) cfg.layer_tile_tokens)
+                           : prefill ? prefill->decode(c, b)
+                                     : llama_decode(c, b);
         if (hook) hook->finish_gpu_decode();
         return result == 0 && !promote_gpu_misses(b.pos ? b.pos[b.n_tokens - 1] : int(gpu_decode_sequence + 1))
                    ? -1
@@ -833,6 +836,11 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         return fail("GPU expert cache needs MoE streaming and full CUDA layer placement");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
         return fail("GPU layer offload does not combine with prefill.device");
+    if (cfg.layer_tile_tokens != 0 &&
+        (cfg.layer_tile_tokens != 512 || cfg.n_ubatch != 64 || cfg.n_ctx < 512 || cfg.spec.enabled() ||
+         cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled))
+        return fail(
+            "layer-tiled prefill requires 512-token tiles, 64-token ubatches, MoE streaming and full CUDA placement");
     if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap)
         return fail("require_release_mmap requires release_mmap");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.moe.enabled && cfg.moe.overlap && cfg.moe.cache_mb == 0 && !cfg.moe.cache_auto)
@@ -1828,7 +1836,7 @@ RunResult Session::generate(const GenerateRequest & req,
             pf = llama_batch_get_one(tokens.data() + i, chunk);
         }
         trace_begin(i, chunk, /*phase*/ 0);
-        if (im.decode_placed(ctx, pf) != 0) {
+        if (im.decode_placed(ctx, pf, im.cfg.layer_tile_tokens > 0) != 0) {
             if (im.cancel_requested.load(std::memory_order_relaxed)) {
                 rollback_turn();
                 res.ok = true;
