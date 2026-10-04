@@ -19,7 +19,7 @@ cmake_minimum_required(VERSION 3.21)
 # The version is declared here and nowhere else in the build: the engine reports it (bmoe-cli
 # --version, and the run-parameter preamble of every metrics CSV), so a committed benchmark file
 # says which engine produced it. Keep it in step with CHANGELOG.md and the app's versionName.
-project(bigmoeonedge VERSION 0.27.0 LANGUAGES CXX)
+project(bigmoeonedge VERSION 0.29.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,6 +60,43 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/CMakeLists.txt")
     endif()
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 endif()
+
+# Keep each Windows executable self-contained for direct launches and CTest. The ggml
+# backends can be loaded dynamically, so include their DLLs even when they are absent
+# from the executable's transitive link dependencies.
+function(bmoe_stage_runtime_dlls target)
+    if(NOT WIN32)
+        return()
+    endif()
+
+    set(_runtime_dlls "$<TARGET_RUNTIME_DLLS:${target}>")
+    foreach(_backend IN LISTS GGML_AVAILABLE_BACKENDS)
+        if(TARGET ${_backend})
+            list(APPEND _runtime_dlls "$<TARGET_FILE:${_backend}>" "$<TARGET_RUNTIME_DLLS:${_backend}>")
+        endif()
+    endforeach()
+
+    # FindCUDAToolkit may expose CUDA libraries as UNKNOWN imported targets, which
+    # TARGET_RUNTIME_DLLS cannot resolve to their DLLs. CUDA 13 keeps them in bin/x64.
+    if(TARGET ggml-cuda)
+        set(_cuda_bin "${CUDAToolkit_BIN_DIR}")
+        if(EXISTS "${_cuda_bin}/x64")
+            string(APPEND _cuda_bin "/x64")
+        endif()
+        foreach(_pattern IN ITEMS "cudart64_*.dll" "cublas64_*.dll" "cublasLt64_*.dll")
+            file(GLOB _matches "${_cuda_bin}/${_pattern}")
+            if(NOT _matches)
+                message(FATAL_ERROR "CUDA runtime ${_pattern} not found in ${_cuda_bin}")
+            endif()
+            list(APPEND _runtime_dlls ${_matches})
+        endforeach()
+    endif()
+
+    list(REMOVE_DUPLICATES _runtime_dlls)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_runtime_dlls} "$<TARGET_FILE_DIR:${target}>"
+        COMMAND_EXPAND_LISTS VERBATIM)
+endfunction()
 
 add_subdirectory(core)
 

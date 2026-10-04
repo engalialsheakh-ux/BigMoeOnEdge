@@ -1,14 +1,23 @@
 # Byte-identity gates. The tiny synthetic models are generated at test time by
-# scripts/make-tiny-moe.py (requires python3 with the gguf package); if it is
-# unavailable the tests are skipped rather than failing the build. One model per expert
+# scripts/make-tiny-moe.py (requires Python with gguf and numpy). One model per expert
 # layout the streamer supports: qwen3moe (split gate/up/down), gemma4 (fused gate_up) and
 # nemotron_h_moe (gate-less up/down).
 
 add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
+add_executable(bmoe_hybrid_gpu_gate hybrid_gpu_gate.cpp)
+target_link_libraries(bmoe_hybrid_gpu_gate PRIVATE bmoe_core)
 # G16 probes the loopback rpc-server port before registering it.
 if(WIN32)
     target_link_libraries(bmoe_moe_gates PRIVATE ws2_32)
+endif()
+
+# Explicit opt-in: this local integration gate compares resident and streamed execution on
+# the actual Qwen3.6 hybrid attention/SSM model with the same CUDA and KV placement.
+if(DEFINED ENV{BMOE_QWEN36_MODEL} AND EXISTS "$ENV{BMOE_QWEN36_MODEL}")
+    add_test(NAME hybrid_gpu_qwen36
+             COMMAND bmoe_hybrid_gpu_gate "$ENV{BMOE_QWEN36_MODEL}" 3000 kv-gpu)
+    set_tests_properties(hybrid_gpu_qwen36 PROPERTIES LABELS "integration;gpu")
 endif()
 target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 
@@ -77,39 +86,52 @@ target_link_libraries(bmoe_decide_test PRIVATE bmoe_core)
 target_include_directories(bmoe_decide_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/engine/decide)
 add_test(NAME decide_policy COMMAND bmoe_decide_test)
 
-find_program(PYTHON3 NAMES python3 python)
+foreach(_test_target IN ITEMS
+        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_chat_parse_test bmoe_think_control_test
+        bmoe_config_test bmoe_mapping_release_test bmoe_ngram_test bmoe_stall_union_test
+        bmoe_csv_summary_test bmoe_decide_test)
+    bmoe_stage_runtime_dlls(${_test_target})
+endforeach()
 
-if(PYTHON3)
-    # arch → (fixture id, gguf filename). Each gets a generate fixture + a gate run.
-    foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe")
-        set(_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-${spec}.gguf")
-        set(_fixture "TINY_MOE_MODEL_${spec}")
-
-        add_test(
-            NAME moe_make_tiny_model_${spec}
-            COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py --arch ${spec} --out ${_model}
-        )
-        set_tests_properties(moe_make_tiny_model_${spec} PROPERTIES FIXTURES_SETUP ${_fixture})
-
-        add_test(NAME moe_gates_${spec} COMMAND bmoe_moe_gates ${_model})
-        set_tests_properties(moe_gates_${spec} PROPERTIES FIXTURES_REQUIRED ${_fixture})
-    endforeach()
-
-    # The same qwen3moe fixture, written as a 4-shard split gguf (metadata-only first shard —
-    # the layout large models actually ship in, since Hugging Face rejects files above 50 GB).
-    # 51 tensors at 20 per shard is deterministic: -00001-of-00004 .. -00004-of-00004. The gate
-    # binary gets the FIRST shard, exactly as a user would pass it; the streamer must resolve
-    # every expert tensor to its (shard, offset) and produce byte-identical output.
-    add_test(
-        NAME moe_make_tiny_model_split
-        COMMAND ${PYTHON3} ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py --arch qwen3moe
-                --split-max-tensors 20 --out "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split.gguf"
-    )
-    set_tests_properties(moe_make_tiny_model_split PROPERTIES FIXTURES_SETUP TINY_MOE_MODEL_split)
-
-    add_test(NAME moe_gates_split
-             COMMAND bmoe_moe_gates "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split-00001-of-00004.gguf")
-    set_tests_properties(moe_gates_split PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_split)
-else()
-    message(WARNING "python3 not found: MoE gates will not run (models cannot be generated)")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import gguf, numpy"
+    RESULT_VARIABLE _python_deps_result ERROR_VARIABLE _python_deps_error)
+if(NOT _python_deps_result EQUAL 0)
+    message(FATAL_ERROR "MoE fixture tests require gguf and numpy in ${Python3_EXECUTABLE}. "
+        "Install with: py -m pip install gguf numpy\n${_python_deps_error}")
 endif()
+
+# arch → (fixture id, gguf filename). Each gets a generate fixture + a gate run.
+foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe")
+    set(_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-${spec}.gguf")
+    set(_fixture "TINY_MOE_MODEL_${spec}")
+
+    add_test(
+        NAME moe_make_tiny_model_${spec}
+        COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py --arch ${spec} --out ${_model}
+    )
+    set_tests_properties(moe_make_tiny_model_${spec} PROPERTIES FIXTURES_SETUP ${_fixture})
+
+    add_test(NAME moe_gates_${spec} COMMAND bmoe_moe_gates ${_model})
+    set_tests_properties(moe_gates_${spec} PROPERTIES FIXTURES_REQUIRED ${_fixture})
+    if(spec STREQUAL "qwen3moe")
+        add_test(NAME hybrid_gpu_gate COMMAND bmoe_hybrid_gpu_gate ${_model})
+        set_tests_properties(hybrid_gpu_gate PROPERTIES FIXTURES_REQUIRED ${_fixture} SKIP_RETURN_CODE 77)
+    endif()
+endforeach()
+
+# The same qwen3moe fixture, written as a 4-shard split gguf (metadata-only first shard —
+# the layout large models actually ship in, since Hugging Face rejects files above 50 GB).
+# 51 tensors at 20 per shard is deterministic: -00001-of-00004 .. -00004-of-00004. The gate
+# binary gets the FIRST shard, exactly as a user would pass it; the streamer must resolve
+# every expert tensor to its (shard, offset) and produce byte-identical output.
+add_test(
+    NAME moe_make_tiny_model_split
+    COMMAND "${Python3_EXECUTABLE}" ${CMAKE_SOURCE_DIR}/scripts/make-tiny-moe.py --arch qwen3moe
+            --split-max-tensors 20 --out "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split.gguf"
+)
+set_tests_properties(moe_make_tiny_model_split PROPERTIES FIXTURES_SETUP TINY_MOE_MODEL_split)
+
+add_test(NAME moe_gates_split
+         COMMAND bmoe_moe_gates "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-split-00001-of-00004.gguf")
+set_tests_properties(moe_gates_split PROPERTIES FIXTURES_REQUIRED TINY_MOE_MODEL_split)

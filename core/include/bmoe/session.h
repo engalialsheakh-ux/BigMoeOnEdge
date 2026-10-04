@@ -49,6 +49,7 @@ struct SessionConfig {
     // Compute-trace granularity: false = a barrier per graph node, true = per layer boundary.
     // Only read when a compute-trace sink is attached. See RunConfig::compute_trace_layers.
     bool compute_trace_layers = false;
+    RunConfig::GpuConfig gpu;
     SamplingConfig sampling; // fixed for the session; greedy by default (temp <= 0)
     MoeStreamConfig moe;
     // Self-speculative decoding, and which source drafts. Fixed for the session: it decides whether

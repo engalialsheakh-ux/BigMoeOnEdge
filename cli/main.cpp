@@ -17,6 +17,8 @@
 #include "bmoe/version.h"
 
 #include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -525,6 +527,10 @@ static void print_usage(const char * argv0) {
         "                          flash-bandwidth claim is checked against the reads that made it\n"
         "      --n-expert-used N   override active MoE experts per token (top-k); lower = faster\n"
         "                          but changes the output (quality). 0 = model default\n"
+        "      --n-gpu-layers N    CUDA layers: 0=CPU (default), -1=all eligible, N=partial\n"
+        "      --main-gpu N        CUDA device index (default 0)\n"
+        "      --no-kv-offload     keep KV and KQV operations on CPU\n"
+        "      --flash-attn M      auto (default) | on | off\n"
         "  -h, --help              show this text and exit\n"
         "      --version           print the engine version and exit\n"
         "\n"
@@ -581,6 +587,7 @@ static void print_usage(const char * argv0) {
         "                          table is left alone, on any architecture\n"
         "      --row-stream-mb N   resident window for those tables in MiB (default 64)\n"
         "      --release-mmap      unmap the model file after load once nothing reads through it\n"
+        "      --require-release-mmap  fail if the requested mapping release is declined\n"
         "                          (Windows: a live mapping serialises the streamer's concurrent reads;\n"
         "                          needs --dense-weights anon|ahwb; measured neutral on Android)\n"
         "      --load-all          debug: read ALL experts each token (A/B baseline)\n"
@@ -730,6 +737,17 @@ int main(int argc, char ** argv) {
             }
             return argv[++i];
         };
+        auto gpu_int = [&](const char * what) -> int {
+            const char * value = next(what);
+            char * end = nullptr;
+            errno = 0;
+            long parsed = std::strtol(value, &end, 10);
+            if (errno == ERANGE || end == value || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
+                std::fprintf(stderr, "bmoe: %s expects an integer, got '%s'\n", what, value);
+                std::exit(2);
+            }
+            return (int) parsed;
+        };
         if (a == "-m" || a == "--model")
             cfg.model_path = next("-m");
         else if (a == "-p" || a == "--prompt")
@@ -756,7 +774,25 @@ int main(int argc, char ** argv) {
             cfg.prefill.load_threads = std::atoi(next("--prefill-loaders"));
         else if (a == "--n-expert-used")
             cfg.n_expert_used = std::atoi(next("--n-expert-used"));
-        else if (a == "--temp")
+        else if (a == "--n-gpu-layers" || a == "-ngl")
+            cfg.gpu.n_gpu_layers = gpu_int(a.c_str());
+        else if (a == "--main-gpu" || a == "-mg")
+            cfg.gpu.main_gpu = gpu_int(a.c_str());
+        else if (a == "--no-kv-offload")
+            cfg.gpu.kv_offload = false;
+        else if (a == "--flash-attn") {
+            const std::string mode = next("--flash-attn");
+            if (mode == "auto")
+                cfg.gpu.flash_attn = RunConfig::GpuConfig::FlashAttention::Auto;
+            else if (mode == "on")
+                cfg.gpu.flash_attn = RunConfig::GpuConfig::FlashAttention::On;
+            else if (mode == "off")
+                cfg.gpu.flash_attn = RunConfig::GpuConfig::FlashAttention::Off;
+            else {
+                std::fprintf(stderr, "bmoe: --flash-attn expects auto|on|off, got '%s'\n", mode.c_str());
+                return 2;
+            }
+        } else if (a == "--temp")
             cfg.sampling.temp = (float) std::atof(next("--temp"));
         else if (a == "--top-k")
             cfg.sampling.top_k = std::atoi(next("--top-k"));
@@ -827,7 +863,10 @@ int main(int argc, char ** argv) {
             cfg.moe.o_direct = false;
         else if (a == "--release-mmap")
             cfg.moe.release_mmap = true;
-        else if (a == "--row-stream")
+        else if (a == "--require-release-mmap") {
+            cfg.moe.release_mmap = true;
+            cfg.moe.require_release_mmap = true;
+        } else if (a == "--row-stream")
             cfg.moe.row_stream = true;
         else if (a == "--row-stream-mb")
             cfg.moe.row_stream_mb = std::atoi(next("--row-stream-mb"));

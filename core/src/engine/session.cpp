@@ -20,6 +20,7 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 
 // llama.cpp's `common` layer (NOT the stable public API): chat-template rendering and
 // reasoning parsing. See the note in the root CMakeLists / docs/seam.md.
@@ -634,6 +635,20 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         error = std::move(msg);
         return nullptr;
     };
+    if (cfg.gpu.n_gpu_layers < -1) return fail("n_gpu_layers must be -1 or nonnegative");
+    if (cfg.gpu.main_gpu < 0) return fail("main_gpu must be nonnegative");
+    if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
+        return fail("GPU layer offload does not combine with prefill.device");
+    if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap)
+        return fail("require_release_mmap requires release_mmap");
+    if (cfg.gpu.n_gpu_layers != 0 && cfg.moe.enabled && cfg.moe.overlap && cfg.moe.cache_mb == 0 && !cfg.moe.cache_auto)
+        return fail("CUDA overlap requires an expert cache; use a positive cache budget");
+    if (cfg.gpu.n_gpu_layers != 0 &&
+        (cfg.moe.row_stream || cfg.moe.drop_cold_frac > 0.0f || cfg.moe.substitute_lambda > 0.0f ||
+         cfg.moe.route_ahead > 0 || cfg.moe.predict_log || cfg.moe.predict_prefetch || cfg.moe.prefetch_layers > 0 ||
+         cfg.decide.enabled || cfg.spec.enabled() || route_trace))
+        return fail("CUDA hybrid currently supports exact streaming without row-stream, routing policies, "
+                    "speculation, decide, prefetch, or route trace");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
@@ -669,7 +684,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     llama_model_params mparams = llama_model_default_params();
     mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     mparams.use_extra_bufts = false;
-    mparams.n_gpu_layers = 0;
+    mparams.n_gpu_layers = cfg.gpu.n_gpu_layers;
     // The nextn/MTP block is skipped at load unless asked for: llama.cpp marks its tensors
     // TENSOR_SKIP by default, and only --mtp builds a graph over them. n_layer_nextn comes from
     // the gguf metadata either way, so the "this model has no trained head" check below is
@@ -682,6 +697,26 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // A device that is missing or does not open leaves the whole run on the CPU, exactly as without
     // the flag: the prefill is slower, the output is the CPU's, and the load does not fail over it.
     std::vector<ggml_backend_dev_t> auto_devices;
+    llama_model_tensor_buft_override expert_overrides[] = {{LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type()},
+                                                           {nullptr, nullptr}};
+    if (cfg.gpu.n_gpu_layers != 0) {
+        std::vector<ggml_backend_dev_t> gpus;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) gpus.push_back(dev);
+        }
+        if (cfg.gpu.main_gpu >= (int) gpus.size())
+            return fail("requested GPU " + std::to_string(cfg.gpu.main_gpu) + " is unavailable (" +
+                        std::to_string(gpus.size()) + " GPU device(s) found)");
+        auto_devices = {gpus[(size_t) cfg.gpu.main_gpu], nullptr};
+        mparams.devices = auto_devices.data();
+        mparams.main_gpu = 0; // the selected device is the only device passed to llama.cpp
+        mparams.tensor_buft_overrides = expert_overrides;
+        // A CUDA host buffer would allocate the entire CPU expert set. Keep CPU weights file-backed.
+        mparams.no_host = true;
+        std::fprintf(stderr, "bmoe: CUDA hybrid requested: %s, gpu-layers=%d, routed experts on CPU\n",
+                     ggml_backend_dev_name(auto_devices[0]), cfg.gpu.n_gpu_layers);
+    }
     if (cfg.prefill.enabled()) {
         std::string derr;
         if (ggml_backend_dev_t dev = detail::PrefillPath::find_device(cfg.prefill.device, derr)) {
@@ -695,10 +730,10 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             im.cfg.prefill.device.clear();
         }
     }
-    if (!im.prefill) {
-        if (const ggml_backend_dev_t * devs = detail::PrefillPath::devices_without_prefill(auto_devices)) {
-            mparams.devices = const_cast<ggml_backend_dev_t *>(devs);
-        }
+    if (!im.prefill && cfg.gpu.n_gpu_layers == 0) {
+        // An explicit empty device list prevents op_offload from using CUDA with zero GPU layers.
+        auto_devices = {nullptr};
+        mparams.devices = auto_devices.data();
     }
 
     // Optional active-expert override: reduce the model's top-k routing (e.g. 8 -> 6) to cut
@@ -789,6 +824,19 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     }
 
     llama_context_params cparams = llama_context_default_params();
+    cparams.offload_kqv = cfg.gpu.n_gpu_layers != 0 && cfg.gpu.kv_offload;
+    cparams.op_offload = cfg.gpu.n_gpu_layers != 0;
+    switch (cfg.gpu.flash_attn) {
+    case RunConfig::GpuConfig::FlashAttention::Auto:
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        break;
+    case RunConfig::GpuConfig::FlashAttention::On:
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        break;
+    case RunConfig::GpuConfig::FlashAttention::Off:
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        break;
+    }
     cparams.n_ctx = cfg.n_ctx;
     cparams.n_batch = cfg.n_batch;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
@@ -934,6 +982,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                 if (!t)
                     return fail(std::string("captured MoE layer is missing expert tensor '") + recipe->exps_suffix[p] +
                                 "'");
+                if (cfg.gpu.n_gpu_layers != 0 && (!t->buffer || !ggml_backend_buffer_is_host(t->buffer)))
+                    return fail(std::string("CUDA hybrid cannot stream non-host expert tensor '") + t->name + "'");
                 auto it = offs.off_by_name.find(t->name);
                 if (it == offs.off_by_name.end()) return fail(std::string("no gguf offset for tensor ") + t->name);
                 L.proj[p].file_off = it->second;
@@ -975,6 +1025,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             std::unordered_map<uint64_t, size_t> dense_at; // (shard, file offset) -> index in `dense`
             for (ggml_tensor * t : im.hook->captured_weight_objects()) {
                 if (!t) continue;
+                // Device-owned dense weights have already been uploaded by llama.cpp. Rebinding
+                // their data pointer to host anon memory would invalidate their CUDA buffer.
+                if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) continue;
                 const std::string name = t->name;
                 if (expert_names.count(name)) continue;
                 auto off = offs.off_by_name.find(name);
@@ -1050,19 +1103,37 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         const size_t still_mapped =
             cfg.moe.release_mmap ? pio::addresses_in_file_mappings(offs.shard_paths, weight_addrs) : 0;
         if (cfg.moe.release_mmap) {
-            if (still_mapped) {
+            if (cfg.gpu.n_gpu_layers > 0) {
+                // Partial placement can leave live host weights outside the capture graph's
+                // observed objects. The full CUDA path and the CPU path were checked separately.
+                std::fprintf(stderr, "bmoe: release-mmap skipped: partial CUDA placement is not proven safe\n");
+                if (cfg.moe.require_release_mmap)
+                    return fail("required model mapping release is unsafe with partial CUDA placement");
+            } else if (still_mapped) {
                 std::fprintf(stderr, "bmoe: release-mmap skipped: %zu weight(s) still read the model's mapping\n",
                              still_mapped);
+                if (cfg.moe.require_release_mmap)
+                    return fail("required model mapping release is unsafe: live weights still read the mapping");
             } else if (!unaccounted.empty() && cfg.spec.is_mtp()) {
                 std::fprintf(stderr, "bmoe: release-mmap skipped: %zu file tensor(s) no policy owns (first: %s)\n",
                              unaccounted.size(), unaccounted.front().c_str());
+                if (cfg.moe.require_release_mmap)
+                    return fail("required model mapping release is unsafe: file tensors have no owner");
             } else {
                 const pio::MappingReleaseReport r =
                     pio::release_file_mappings(offs.shard_paths, &im.mapping_placeholders);
                 // Lanes opened while the section was alive stay serialised against it even once it
                 // is gone (measured: iobench S3 vs S4), so the readers are reopened after the release.
-                if (r.supported && (r.views_unmapped || r.sections_closed) && !im.source.reopen_readers())
+                const bool readers_reopened =
+                    !r.supported || !(r.views_unmapped || r.sections_closed) || im.source.reopen_readers();
+                if (!readers_reopened)
                     std::fprintf(stderr, "bmoe: release-mmap: reader reopen failed; reads stay serialised\n");
+                if (cfg.moe.require_release_mmap &&
+                    (!r.supported || r.views_unmapped == 0 || !r.error.empty() || !readers_reopened))
+                    return fail("required model mapping release did not complete: " +
+                                (r.error.empty()
+                                     ? (readers_reopened ? "no views were unmapped" : "reader reopen failed")
+                                     : r.error));
                 if (r.supported) // POSIX has nothing to undo and says nothing
                     std::fprintf(stderr,
                                  "bmoe: release-mmap: %d view(s) unmapped (%llu MiB), %d section(s) closed%s%s%s\n",

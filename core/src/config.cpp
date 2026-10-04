@@ -54,6 +54,22 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.n_ctx <= 0) {
         return fail("n_ctx must be positive");
     }
+    if (cfg.gpu.n_gpu_layers < -1) {
+        return fail("gpu.n_gpu_layers must be -1 (all eligible) or >= 0");
+    }
+    if (cfg.gpu.main_gpu < 0) {
+        return fail("gpu.main_gpu must be >= 0");
+    }
+    if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled()) {
+        return fail("GPU layer offload does not combine with prefill.device");
+    }
+    if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap) {
+        return fail("moe.require_release_mmap requires moe.release_mmap");
+    }
+    if (cfg.gpu.n_gpu_layers != 0 && cfg.moe.enabled && cfg.moe.overlap && cfg.moe.cache_mb == 0 &&
+        !cfg.moe.cache_auto) {
+        return fail("CUDA overlap requires an expert cache; use --cache-mb N or auto");
+    }
     // 0 means "as wide as the context"; anything larger than the context would be reserved for a
     // batch that can never arrive, which is the opposite of what this knob is for.
     if (cfg.n_ubatch < 0) {

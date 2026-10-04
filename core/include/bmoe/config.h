@@ -136,6 +136,7 @@ struct MoeStreamConfig {
     // weights mmap'd, a tied output head, an unowned tensor under the MTP draft — but a future
     // architecture can invent another one. See Session::open.
     bool release_mmap = false;
+    bool require_release_mmap = false; // fail if a requested release is declined or incomplete
 
     // ── cache-aware expert dropping (lossy; opt-in) ──────────────────────────────────
     // Skip a routed expert when it is a cache MISS *and* the router weighted it below
@@ -479,6 +480,16 @@ struct RunConfig {
     // to an untraced run. Only meaningful when a compute-trace sink is attached; see
     // bmoe/decode_trace.h for what the layer-mode rows contain.
     bool compute_trace_layers = false;
+
+    // Optional CUDA placement. Zero keeps this engine on CPU even in a CUDA-enabled build.
+    // Negative one requests every GPU-eligible layer; streamed routed experts stay on CPU.
+    struct GpuConfig {
+        enum class FlashAttention { Auto, On, Off };
+        int n_gpu_layers = 0;
+        int main_gpu = 0;
+        bool kv_offload = true;
+        FlashAttention flash_attn = FlashAttention::Auto;
+    } gpu;
 
     SamplingConfig sampling; // greedy by default (temp <= 0); opt-in stochastic decoding
     MoeStreamConfig moe;

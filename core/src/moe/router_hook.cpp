@@ -1587,10 +1587,19 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
         }
 
         gathered_.clear();
-        for (int j = 0; j < nt; ++j)
-            for (int k = 0; k < nu; ++k)
-                gathered_.push_back(
-                    *(const int32_t *) ((const char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]));
+        ggml_backend_buffer_t topk_buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        if (topk_buffer && !ggml_backend_buffer_is_host(topk_buffer)) {
+            // The isolated callback is synchronized, but t->data is still a device pointer.
+            // The top-k node is a strided view of argsort; copy only its selected IDs.
+            gathered_.resize((size_t) nu * nt);
+            ggml_backend_tensor_get_2d(t, gathered_.data(), 0, (size_t) nu * sizeof(int32_t), (size_t) nt, t->nb[1],
+                                       (size_t) nu * sizeof(int32_t));
+        } else {
+            for (int j = 0; j < nt; ++j)
+                for (int k = 0; k < nu; ++k)
+                    gathered_.push_back(
+                        *(const int32_t *) ((const char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]));
+        }
 
         if (trace_on_) {
             flush_pending(); // the previous layer's whole weight chain has been offered by now

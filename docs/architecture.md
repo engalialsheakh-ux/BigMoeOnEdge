@@ -52,6 +52,12 @@ The pure-policy code (`config.cpp`, `arch_registry.cpp`) compiles with no native
 dependency, so a subset of the project builds and is testable before llama.cpp is
 fetched.
 
+On a CUDA-enabled host build, `Session::open` optionally selects one GPU for llama.cpp's dense
+layers and KV state. The same MoE recipe and expert stream continue to feed CPU expert tensors;
+the router retrieves CUDA-backed top-k IDs through ggml's public tensor-copy API. GPU-owned dense
+weights are left under llama.cpp's backend instead of being rebound into host anonymous memory.
+The CUDA placement and its current restrictions are described in [cuda-hybrid.md](cuda-hybrid.md).
+
 ## Why the streaming seam needs no fork
 
 Streaming experts serially needs three things from the inference engine. All three are

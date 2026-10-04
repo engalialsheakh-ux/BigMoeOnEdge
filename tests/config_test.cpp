@@ -55,6 +55,38 @@ int main() {
     expect_ok("valid minimal config", ok_base());
     {
         RunConfig c = ok_base();
+        expect_ok("GPU disabled by default", c);
+        c.gpu.n_gpu_layers = -1;
+        expect_ok("all eligible GPU layers requested", c);
+        c.gpu.n_gpu_layers = -2;
+        expect_fail("unsupported negative GPU layer count", c);
+        c.gpu.n_gpu_layers = 1;
+        c.gpu.main_gpu = -1;
+        expect_fail("negative GPU device index", c);
+        c.gpu.main_gpu = 0;
+        c.prefill.device = "HTP0";
+        expect_fail("GPU layer offload with prefill device", c);
+    }
+    {
+        RunConfig c = ok_moe();
+        c.moe.require_release_mmap = true;
+        expect_fail("strict mapping release needs release-mmap", c);
+        c.moe.release_mmap = true;
+        expect_ok("strict mapping release with release-mmap", c);
+    }
+    {
+        RunConfig c = ok_moe();
+        c.gpu.n_gpu_layers = -1;
+        c.moe.overlap = true;
+        expect_fail("CUDA overlap without an expert cache", c);
+        c.moe.cache_auto = true;
+        expect_ok("CUDA overlap with automatic expert cache", c);
+        c.moe.cache_auto = false;
+        c.moe.cache_mb = 2000;
+        expect_ok("CUDA overlap with fixed expert cache", c);
+    }
+    {
+        RunConfig c = ok_base();
         c.model_path.clear();
         expect_fail("empty model_path", c);
     }

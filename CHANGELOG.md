@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.29.0] - 2026-10-01
+
+### Added
+- Optional CUDA dense-layer and KV placement in the Windows host CLI. Routed experts still stream
+  through the CPU path, with a small public ggml copy for CUDA-backed routing IDs. CPU execution
+  remains the default. The host CLI exposes `--n-gpu-layers`, `--main-gpu`, `--no-kv-offload` and
+  `--flash-attn`; `--require-release-mmap` makes mapping-release experiments strict. The CUDA path
+  rejects combinations whose callback access is not yet device-safe, including zero-cache overlap.
+  Mapping release is declined for partial CUDA layer placement until its remaining live host tensors
+  can be accounted for.
+  A GPU-resident versus streamed gate and a real Qwen3.6 integration run cover the exact expert path.
+  Build instructions, restrictions and measured results are in [docs/cuda-hybrid.md](docs/cuda-hybrid.md).
+
+### Fixed
+- Stage llama.cpp, ggml backend, and CUDA runtime DLLs beside every Windows test executable
+  and the CLI so CTest runs without manual `PATH` changes. Require `gguf` and `numpy` at
+  configure time when model fixture tests are enabled.
+- Honor the requested cache size in the real-model hybrid GPU gate, explicitly test the
+  zero-cache rejection path, and log the cache and KV placement used by the gate.
+
 ## [0.28.0] - 2026-09-29
 
 ### Changed

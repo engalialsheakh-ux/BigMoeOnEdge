@@ -99,7 +99,10 @@ layers at a time, which is several times faster on long prompts
 ([docs/npu-prefill.md](docs/npu-prefill.md)).
 
 The same engine builds unmodified on desktop, where a model past RAM streams from the SSD out of
-the box. Phones stay the focus, because that is where memory is tightest.
+the box. A CUDA-enabled Windows host build can optionally place dense work and KV state on the GPU
+while the routed experts continue to stream through CPU memory. It is opt-in and measured separately
+from the phone results below; see [hybrid CUDA decode](docs/cuda-hybrid.md). Phones stay the focus,
+because that is where memory is tightest.
 
 ## Try it on your phone
 
@@ -470,7 +473,10 @@ build/cli/bmoe-cli -m gpt-oss-120b-Q4_K_M.gguf --moe-stream --overlap \
 
 The model must live on a real filesystem (on Android `/data/local/tmp/...`, not `/sdcard`). Omit
 `--moe-stream` for the plain mmap baseline. The byte-identity gates (streamed == resident) run with
-`cd build && ctest --output-on-failure` (needs `python3` with the `gguf` package).
+`cd build && ctest --output-on-failure`. Fixture generation needs Python with `gguf` and
+`numpy`; install them with `py -m pip install gguf numpy` on Windows or
+`python3 -m pip install gguf numpy` elsewhere before configuring CMake. CMake fails with a
+dependency message if either package is unavailable to its selected Python interpreter.
 
 Platform status: Linux is exercised by CI (build + gates), and Windows and macOS are
 compile-checked there on every pull request and release tag. Windows is where the
