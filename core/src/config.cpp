@@ -60,6 +60,12 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.gpu.main_gpu < 0) {
         return fail("gpu.main_gpu must be >= 0");
     }
+    if (cfg.gpu.expert_cache_mb < 0) {
+        return fail("gpu.expert_cache_mb must be >= 0");
+    }
+    if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1)) {
+        return fail("gpu.expert_cache_mb requires --moe-stream and --n-gpu-layers -1");
+    }
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled()) {
         return fail("GPU layer offload does not combine with prefill.device");
     }

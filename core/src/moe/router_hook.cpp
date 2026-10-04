@@ -6,8 +6,10 @@
 #include "device_arena.h"
 #include "../io/platform_io.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -18,6 +20,55 @@ RouterHook::RouterHook(const MoeRecipe & recipe, int n_layer) : recipe_(recipe),
     const int n = n_layer_ > 0 ? n_layer_ : 0;
     captured_.assign(n, LayerExperts{});
     prev_ids_.assign(n, std::vector<int32_t>{});
+}
+
+void RouterHook::set_gpu_expert_pool(GpuExpertPool * pool) {
+    gpu_pool_ = pool;
+    if (!pool) return;
+    gpu_slots_.assign(size_t(pool->expert_count()), 0);
+    gpu_graph_layers_.assign(pool->layers().size(), 0);
+    gpu_mapped_layers_.assign(pool->layers().size(), 0);
+}
+
+void RouterHook::begin_gpu_decode() {
+    if (!gpu_pool_) return;
+    if (!gpu_pins_.empty()) {
+        std::fprintf(stderr, "bmoe: GPU expert cache pin survived the previous decode\n");
+        std::abort();
+    }
+    // The scheduler asks about the cache branch after the top-k split. Keep
+    // support discovered in a prior single-token graph for later decodes.
+    std::fill(gpu_mapped_layers_.begin(), gpu_mapped_layers_.end(), 0);
+    gpu_misses_.clear();
+}
+
+void RouterHook::finish_gpu_decode() {
+    if (!gpu_pool_) return;
+    std::fill(gpu_slots_.begin(), gpu_slots_.end(), 0);
+    for (size_t il = 0; il < gpu_mapped_layers_.size(); ++il) {
+        if (gpu_mapped_layers_[il] && !gpu_pool_->update_mapping(int(il), gpu_slots_.data(), int(gpu_slots_.size()))) {
+            std::fprintf(stderr, "bmoe: failed to clear GPU expert map for layer %zu\n", il);
+            std::abort();
+        }
+    }
+    for (auto lease : gpu_pins_) {
+        if (!gpu_pool_->unpin(lease)) {
+            std::fprintf(stderr, "bmoe: stale GPU expert lease after decode\n");
+            std::abort();
+        }
+    }
+    gpu_pins_.clear();
+    if (batch_phase_ == 1 && !gpu_unsupported_logged_) {
+        for (size_t il = 0; il < gpu_pool_->layers().size(); ++il) {
+            if (gpu_pool_->layers()[il].slot_count && !gpu_graph_layers_[il]) {
+                std::fprintf(
+                    stderr, "bmoe: GPU expert cache graph unsupported at MoE layer %zu; CPU streaming remains active\n",
+                    il);
+                gpu_unsupported_logged_ = true;
+                break;
+            }
+        }
+    }
 }
 
 // Match a tensor name of the form "blk.<il>.<suffix>.weight" against the recipe's expert
@@ -1471,6 +1522,11 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
     // One prefix test decides whether any of the three matchers below can possibly fire. The vast
     // majority of a graph's nodes fail it and leave having done nothing else.
     const bool moe_node = is_moe_node(t->name);
+    if (gpu_pool_ && ask && moe_node) {
+        const int cache_layer = match_layer_node(t->name, "ffn_moe_cache_slots-");
+        if (cache_layer >= 0 && size_t(cache_layer) < gpu_graph_layers_.size())
+            gpu_graph_layers_[size_t(cache_layer)] = 1;
+    }
     const int il = moe_node ? match_layer_node(t->name, "ffn_moe_topk-") : -1;
     const bool is_topk = il >= 0;
     // The weight nodes are asked for by a traced run, and by the drop policy, which decides on the
@@ -1601,6 +1657,43 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
                         *(const int32_t *) ((const char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]));
         }
 
+        const bool gpu_mapping = gpu_pool_ && batch_phase_ == 1 && nt == 1 && il >= 0 &&
+                                 size_t(il) < gpu_graph_layers_.size() && gpu_graph_layers_[size_t(il)];
+        if (gpu_mapping) {
+            if (gpu_mapped_layers_[size_t(il)]) {
+                std::fprintf(stderr, "bmoe: GPU expert map changed twice in one decode, layer %d\n", il);
+                std::abort();
+            }
+            std::fill(gpu_slots_.begin(), gpu_slots_.end(), 0);
+            gpu_cpu_ids_.clear();
+            for (int32_t expert : gathered_) {
+                if (expert < 0 || size_t(expert) >= gpu_slots_.size()) {
+                    std::fprintf(stderr, "bmoe: invalid routed expert %d in layer %d\n", expert, il);
+                    std::abort();
+                }
+                const auto lease = gpu_pool_->pin(il, expert);
+                if (lease) {
+                    gpu_slots_[size_t(expert)] = lease.slot;
+                    gpu_pins_.push_back(lease);
+                    ++gpu_hits_;
+                } else {
+                    gpu_cpu_ids_.push_back(expert);
+                    gpu_misses_.emplace_back(il, expert);
+                    ++gpu_cpu_misses_;
+                }
+            }
+            if (!gpu_pool_->update_mapping(il, gpu_slots_.data(), int(gpu_slots_.size()))) {
+                std::fprintf(stderr, "bmoe: GPU expert map rejected layer %d\n", il);
+                std::abort();
+            }
+            gpu_mapped_layers_[size_t(il)] = 1;
+        } else if (gpu_pool_ && batch_phase_ == 1 && nt == 1 && il >= 0 && size_t(il) < gpu_pool_->layers().size() &&
+                   gpu_pool_->layers()[size_t(il)].slot_count) {
+            // The first graph reveals its cache branch after top-k. Its routed
+            // experts still run on CPU and belong in the miss counter.
+            gpu_cpu_misses_ += gathered_.size();
+        }
+
         if (trace_on_) {
             flush_pending(); // the previous layer's whole weight chain has been offered by now
             pending_.layer = il;
@@ -1641,7 +1734,9 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
         if (defer) {
             drop_ids_ = gathered_;
         } else {
-            source_->load_layer(il, gathered_.data(), (int) gathered_.size());
+            const int32_t * cpu_ids = gpu_mapping ? gpu_cpu_ids_.data() : gathered_.data();
+            const int cpu_count = gpu_mapping ? int(gpu_cpu_ids_.size()) : int(gathered_.size());
+            if (cpu_count > 0) source_->load_layer(il, cpu_ids, cpu_count);
             // Deferred layers speculate from apply_drop instead — after THEIR load, for the same
             // reason this call sits after the one above: the load's quiesce would cancel it.
             predict_after_load(il);

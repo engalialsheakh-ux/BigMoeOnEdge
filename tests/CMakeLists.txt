@@ -7,6 +7,29 @@ add_executable(bmoe_moe_gates moe_gates.cpp)
 target_link_libraries(bmoe_moe_gates PRIVATE bmoe_core)
 add_executable(bmoe_hybrid_gpu_gate hybrid_gpu_gate.cpp)
 target_link_libraries(bmoe_hybrid_gpu_gate PRIVATE bmoe_core)
+add_executable(bmoe_gpu_expert_pool_test gpu_expert_pool_test.cpp)
+target_link_libraries(bmoe_gpu_expert_pool_test PRIVATE bmoe_core)
+target_include_directories(bmoe_gpu_expert_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME gpu_expert_pool COMMAND bmoe_gpu_expert_pool_test)
+set_tests_properties(gpu_expert_pool PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+add_executable(bmoe_gpu_expert_matmul_test gpu_expert_matmul_test.cpp)
+target_link_libraries(bmoe_gpu_expert_matmul_test PRIVATE bmoe_core)
+target_include_directories(bmoe_gpu_expert_matmul_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME gpu_expert_matmul COMMAND bmoe_gpu_expert_matmul_test)
+set_tests_properties(gpu_expert_matmul PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+add_executable(bmoe_gpu_expert_moe_layer_test gpu_expert_moe_layer_test.cpp)
+target_link_libraries(bmoe_gpu_expert_moe_layer_test PRIVATE bmoe_core)
+target_include_directories(bmoe_gpu_expert_moe_layer_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME gpu_expert_moe_layer COMMAND bmoe_gpu_expert_moe_layer_test)
+set_tests_properties(gpu_expert_moe_layer PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+add_executable(bmoe_cpu_expert_skip_test cpu_expert_skip_test.cpp)
+target_link_libraries(bmoe_cpu_expert_skip_test PRIVATE bmoe_core)
+add_test(NAME cpu_expert_skip COMMAND bmoe_cpu_expert_skip_test)
+add_executable(bmoe_gpu_expert_mixed_test gpu_expert_mixed_test.cpp)
+target_link_libraries(bmoe_gpu_expert_mixed_test PRIVATE bmoe_core)
+target_include_directories(bmoe_gpu_expert_mixed_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME gpu_expert_mixed COMMAND bmoe_gpu_expert_mixed_test)
+set_tests_properties(gpu_expert_mixed PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
 # G16 probes the loopback rpc-server port before registering it.
 if(WIN32)
     target_link_libraries(bmoe_moe_gates PRIVATE ws2_32)
@@ -18,6 +41,9 @@ if(DEFINED ENV{BMOE_QWEN36_MODEL} AND EXISTS "$ENV{BMOE_QWEN36_MODEL}")
     add_test(NAME hybrid_gpu_qwen36
              COMMAND bmoe_hybrid_gpu_gate "$ENV{BMOE_QWEN36_MODEL}" 3000 kv-gpu)
     set_tests_properties(hybrid_gpu_qwen36 PROPERTIES LABELS "integration;gpu")
+    add_test(NAME hybrid_gpu_qwen36_pool_allocation
+             COMMAND bmoe_hybrid_gpu_gate "$ENV{BMOE_QWEN36_MODEL}" 3000 kv-gpu 512)
+    set_tests_properties(hybrid_gpu_qwen36_pool_allocation PROPERTIES LABELS "integration;gpu")
 endif()
 target_include_directories(bmoe_moe_gates PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 
@@ -87,7 +113,10 @@ target_include_directories(bmoe_decide_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src
 add_test(NAME decide_policy COMMAND bmoe_decide_test)
 
 foreach(_test_target IN ITEMS
-        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_chat_parse_test bmoe_think_control_test
+        bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
+        bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test
+        bmoe_cpu_expert_skip_test
+        bmoe_chat_parse_test bmoe_think_control_test
         bmoe_config_test bmoe_mapping_release_test bmoe_ngram_test bmoe_stall_union_test
         bmoe_csv_summary_test bmoe_decide_test)
     bmoe_stage_runtime_dlls(${_test_target})

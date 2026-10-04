@@ -33,6 +33,7 @@ if(BMOE_HAVE_LLAMA)
         src/moe/row_stream.cpp
         src/moe/gguf_offsets.cpp
         src/moe/expert_stream_source.cpp
+        src/moe/gpu_expert_pool.cpp
         src/moe/router_hook.cpp
         src/moe/decide_probe.cpp
         src/moe/device_arena.cpp

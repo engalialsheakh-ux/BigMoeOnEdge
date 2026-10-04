@@ -33,6 +33,7 @@
 #include "bmoe/predict_stats.h"
 #include "bmoe/row_source.h"
 #include "expert_stream_source.h"
+#include "gpu_expert_pool.h"
 
 namespace bmoe {
 class DeviceExpertArena;
@@ -46,6 +47,7 @@ class DecideProbe;
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -128,6 +130,13 @@ public:
     const std::unordered_set<const ggml_tensor *> & non_matrix_weights() const { return non_matrix_weights_; }
 
     void set_source(IExpertSource * src) { source_ = src; } // non-null → stream mode
+
+    void set_gpu_expert_pool(GpuExpertPool * pool);
+    void begin_gpu_decode();
+    void finish_gpu_decode();
+    const std::vector<std::pair<int, int>> & gpu_misses() const { return gpu_misses_; }
+    uint64_t gpu_hits() const { return gpu_hits_; }
+    uint64_t gpu_cpu_misses() const { return gpu_cpu_misses_; }
 
     // Install the row-gathered residency policy (see bmoe/row_source.h). Non-null makes the stream
     // pass check every gather node against it and make the rows present before the node runs.
@@ -236,6 +245,7 @@ public:
     // is decode-only unless armed for prefill, and unlike the traces it must know this on every
     // run, so it cannot ride on begin_trace_batch.
     void set_batch_phase(int phase) { batch_phase_ = phase; }
+    int batch_phase() const { return batch_phase_; }
 
     // Graph nodes whose output lives in a non-host buffer, i.e. that a device backend computed. The
     // proof a prefill device ran, as opposed to merely having the weights moved onto it: a backend
@@ -527,6 +537,16 @@ private:
     bool drop_renorm_ = true;
     bool drop_prefill_ = false;
     int batch_phase_ = 1; // 0 prefill, 1 decode
+    GpuExpertPool * gpu_pool_ = nullptr;
+    std::vector<GpuExpertPool::Lease> gpu_pins_;
+    std::vector<std::pair<int, int>> gpu_misses_;
+    std::vector<int32_t> gpu_slots_;
+    std::vector<int32_t> gpu_cpu_ids_;
+    std::vector<uint8_t> gpu_graph_layers_;
+    std::vector<uint8_t> gpu_mapped_layers_;
+    uint64_t gpu_hits_ = 0;
+    uint64_t gpu_cpu_misses_ = 0;
+    bool gpu_unsupported_logged_ = false;
     long long experts_routed_ = 0, experts_dropped_ = 0;
     bool count_device_nodes_ = false;
     long long device_nodes_ = 0;

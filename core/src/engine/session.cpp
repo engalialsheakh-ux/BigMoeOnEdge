@@ -14,6 +14,7 @@
 #include "../moe/router_hook.h"
 #include "../moe/decide_probe.h"
 #include "../moe/expert_stream_source.h"
+#include "../moe/gpu_expert_pool.h"
 #include "../moe/gguf_offsets.h"
 #include "../io/platform_io.h"
 #include "../io/mapping_release.h"
@@ -29,15 +30,20 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -237,6 +243,30 @@ struct Session::Impl {
     std::unique_ptr<llama_context, void (*)(llama_context *)> ctx{nullptr, llama_free};
     std::unique_ptr<RouterHook> hook; // heap: its address is baked into cparams.cb_eval_user_data
     ExpertStreamSource source;
+    GpuExpertPool gpu_experts;
+    std::unique_ptr<ggml_context, void (*)(ggml_context *)> gpu_expert_metadata{nullptr, ggml_free};
+    std::vector<llama_expert_cache_layer> gpu_expert_layers;
+    bool gpu_graph_attached = false;
+    uint64_t gpu_promotions = 0;
+    uint64_t gpu_upload_bytes = 0;
+    double gpu_upload_ms = 0.0;
+    std::vector<uint32_t> gpu_recent_miss;
+    uint32_t gpu_decode_sequence = 0;
+    struct GpuPromotionJob {
+        int layer = -1;
+        int expert = -1;
+        size_t total_bytes = 0;
+        std::array<std::vector<uint8_t>, MoeRecipe::max_exps> projections;
+    };
+    std::mutex gpu_job_mtx;
+    std::condition_variable gpu_job_cv;
+    std::deque<GpuPromotionJob> gpu_jobs;
+    std::vector<uint8_t> gpu_queued;
+    std::thread gpu_worker;
+    std::atomic<bool> gpu_worker_failed{false};
+    bool gpu_worker_stop = false;
+    size_t gpu_pending_bytes = 0;
+    static constexpr size_t gpu_staging_limit = 128ull * 1024ull * 1024ull;
 
     // Prefill on an accelerator (SessionConfig::prefill); null when off. Created before the model
     // load, whose device list it holds, and opened after it.
@@ -245,8 +275,116 @@ struct Session::Impl {
     void place_prefill(bool on_device) {
         if (prefill) prefill->place(on_device);
     }
+    void run_gpu_worker() {
+        for (;;) {
+            GpuPromotionJob job;
+            {
+                std::unique_lock<std::mutex> lock(gpu_job_mtx);
+                gpu_job_cv.wait(lock, [&] { return gpu_worker_stop || !gpu_jobs.empty(); });
+                if (gpu_jobs.empty() && gpu_worker_stop) return;
+                job = std::move(gpu_jobs.front());
+                gpu_jobs.pop_front();
+                gpu_pending_bytes -= job.total_bytes;
+            }
+            auto lease = gpu_experts.reserve(job.layer, job.expert);
+            if (lease) {
+                const auto started = clock_t_::now();
+                bool uploaded = true;
+                for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                    const auto & bytes = job.projections[p];
+                    if (!gpu_experts.upload(lease, p, bytes.data(), bytes.size())) {
+                        uploaded = false;
+                        break;
+                    }
+                }
+                gpu_upload_ms += secs(started, clock_t_::now()) * 1000.0;
+                if (uploaded && gpu_experts.publish(lease)) {
+                    gpu_upload_bytes += job.total_bytes;
+                    ++gpu_promotions;
+                } else {
+                    gpu_experts.abandon(lease);
+                    gpu_worker_failed.store(true, std::memory_order_release);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(gpu_job_mtx);
+                gpu_queued[size_t(job.layer) * size_t(gpu_experts.expert_count()) + size_t(job.expert)] = 0;
+            }
+        }
+    }
+    void stop_gpu_worker() {
+        if (!gpu_worker.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(gpu_job_mtx);
+            gpu_worker_stop = true;
+        }
+        gpu_job_cv.notify_one();
+        gpu_worker.join();
+    }
+    void set_gpu_graph_for_batch(llama_context * c, const llama_batch & b) {
+        if (!gpu_experts.buffer() || !hook) return;
+        const bool want = hook->batch_phase() == 1 && b.n_tokens == 1;
+        if (want == gpu_graph_attached) return;
+        llama_set_expert_cache_layers(c, want ? gpu_expert_layers.data() : nullptr,
+                                      want ? gpu_expert_layers.size() : 0);
+        gpu_graph_attached = want;
+    }
+    bool promote_gpu_misses() {
+        if (!gpu_experts.buffer() || !hook || !cfg.gpu.expert_cache_promote) return true;
+        if (gpu_worker_failed.load(std::memory_order_acquire)) return false;
+        if (hook->gpu_misses().empty()) return true;
+        ++gpu_decode_sequence;
+        std::vector<uint8_t> promoted(gpu_experts.layers().size(), 0);
+        for (const auto & [layer, expert] : hook->gpu_misses()) {
+            if (layer < 0 || size_t(layer) >= promoted.size() || promoted[size_t(layer)]) continue;
+            const size_t recent_index = size_t(layer) * size_t(gpu_experts.expert_count()) + size_t(expert);
+            if (recent_index >= gpu_recent_miss.size()) return false;
+            const uint32_t prior = gpu_recent_miss[recent_index];
+            gpu_recent_miss[recent_index] = gpu_decode_sequence;
+            // Repeated routing within a short window is evidence of reuse. The
+            // one-hit admission policy churned over 20 slots per token at 2 GiB.
+            if (prior == 0 || gpu_decode_sequence - prior > 8) continue;
+            const void * bytes[MoeRecipe::max_exps]{};
+            size_t sizes[MoeRecipe::max_exps]{};
+            if (!source.resident_bundle(layer, expert, bytes, sizes)) continue;
+            GpuPromotionJob job;
+            job.layer = layer;
+            job.expert = expert;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p)
+                job.total_bytes += sizes[p];
+            {
+                std::lock_guard<std::mutex> lock(gpu_job_mtx);
+                if (gpu_queued[recent_index] || job.total_bytes > gpu_staging_limit - gpu_pending_bytes) continue;
+            }
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                const auto * first = static_cast<const uint8_t *>(bytes[p]);
+                job.projections[p].assign(first, first + sizes[p]);
+            }
+            {
+                std::lock_guard<std::mutex> lock(gpu_job_mtx);
+                if (gpu_queued[recent_index] || job.total_bytes > gpu_staging_limit - gpu_pending_bytes) continue;
+                gpu_pending_bytes += job.total_bytes;
+                gpu_queued[recent_index] = 1;
+                gpu_jobs.push_back(std::move(job));
+            }
+            gpu_job_cv.notify_one();
+            promoted[size_t(layer)] = 1;
+        }
+        return !gpu_worker_failed.load(std::memory_order_acquire);
+    }
+    int decode_target(llama_context * c, const llama_batch & b) {
+        set_gpu_graph_for_batch(c, b);
+        if (hook) hook->begin_gpu_decode();
+        const int result = llama_decode(c, b);
+        if (hook) hook->finish_gpu_decode();
+        return result == 0 && !promote_gpu_misses() ? -1 : result;
+    }
     int decode_placed(llama_context * c, const llama_batch & b) {
-        return prefill ? prefill->decode(c, b) : llama_decode(c, b);
+        set_gpu_graph_for_batch(c, b);
+        if (hook) hook->begin_gpu_decode();
+        const int result = prefill ? prefill->decode(c, b) : llama_decode(c, b);
+        if (hook) hook->finish_gpu_decode();
+        return result == 0 && !promote_gpu_misses() ? -1 : result;
     }
     // Every exit from a prefill (errors and cancellation included) leaves the weights on the host:
     // the next graph may be a decode, and the CPU cannot read a device buffer.
@@ -356,6 +494,14 @@ struct Session::Impl {
     std::atomic<bool> cancel_requested{false};
 
     ~Impl() {
+        stop_gpu_worker();
+        if (gpu_experts.buffer() && hook)
+            std::fprintf(stderr,
+                         "bmoe-gpu-cache: gpu_expert_hits=%llu cpu_expert_misses=%llu gpu_promotions=%llu "
+                         "gpu_evictions=%llu gpu_cache_resident=%zu gpu_upload_mib=%.2f gpu_upload_ms=%.3f\n",
+                         (unsigned long long) hook->gpu_hits(), (unsigned long long) hook->gpu_cpu_misses(),
+                         (unsigned long long) gpu_promotions, (unsigned long long) gpu_experts.evictions(),
+                         gpu_experts.resident_count(), double(gpu_upload_bytes) / (1024.0 * 1024.0), gpu_upload_ms);
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend.
@@ -369,6 +515,10 @@ struct Session::Impl {
         if (mtp_batch_owned) llama_batch_free(mtp_batch);
         ctx_dft.reset();
         ctx.reset();
+        // The context graph may retain tensor descriptors backed by this pool.
+        gpu_expert_layers.clear();
+        gpu_expert_metadata.reset();
+        gpu_experts.reset();
         hook.reset();
         model.reset();
         mapping_placeholders.release();
@@ -435,7 +585,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         llama_batch warm = llama_batch_init(1, 0, 1);
         batch_fill(warm, tokens.data(), 1, 0, false);
         im.hook->set_batch_phase(req.as_decode ? 1 : 0);
-        const int rc = llama_decode(ctx, warm);
+        const int rc = im.decode_target(ctx, warm);
         llama_batch_free(warm);
         if (rc != 0) {
             r.error = "warm-up decode failed";
@@ -481,7 +631,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         const int prefix = std::max(1, std::min(req.skip, n - 1));
         batch_fill(b, tokens.data(), prefix, /*pos0*/ 0, /*all_logits*/ false);
         im.hook->set_batch_phase(0);
-        if (llama_decode(ctx, b) != 0) {
+        if (im.decode_target(ctx, b) != 0) {
             r.error = "prefill decode failed";
             return r;
         }
@@ -490,7 +640,7 @@ PplResult Session::perplexity(const PplRequest & req) {
         for (int pos = prefix; pos < last; ++pos) {
             batch_fill(b, tokens.data() + pos, 1, pos, /*all_logits*/ true);
             im.hook->set_batch_phase(1);
-            if (llama_decode(ctx, b) != 0) {
+            if (im.decode_target(ctx, b) != 0) {
                 r.error = "decode failed at position " + std::to_string(pos);
                 return r;
             }
@@ -637,6 +787,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     };
     if (cfg.gpu.n_gpu_layers < -1) return fail("n_gpu_layers must be -1 or nonnegative");
     if (cfg.gpu.main_gpu < 0) return fail("main_gpu must be nonnegative");
+    if (cfg.gpu.expert_cache_mb < 0) return fail("gpu expert cache budget must be nonnegative");
+    if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1))
+        return fail("GPU expert cache needs MoE streaming and full CUDA layer placement");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
         return fail("GPU layer offload does not combine with prefill.device");
     if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap)
@@ -954,7 +1107,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         if (warm_tok < 0) warm_tok = 0;
         if (cfg.spec.is_mtp()) {
             batch_fill(im.mtp_batch, &warm_tok, 1, /*pos0*/ 0, /*all_logits*/ true);
-            if (llama_decode(ctx, im.mtp_batch) != 0) return fail("capture warm-up decode failed");
+            if (im.decode_target(ctx, im.mtp_batch) != 0) return fail("capture warm-up decode failed");
             // The MTP graph is built only by a decode on the draft context, and process() is what
             // issues it. Without this pass the head's expert layer never reaches the eval callback,
             // so it would stay unbound and silently mmap-resident — the one thing streaming exists
@@ -963,7 +1116,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                 return fail("MTP capture warm-up failed: the draft context could not process the batch");
         } else {
             llama_batch warm = llama_batch_get_one(&warm_tok, 1);
-            if (llama_decode(ctx, warm) != 0) return fail("capture warm-up decode failed");
+            if (im.decode_target(ctx, warm) != 0) return fail("capture warm-up decode failed");
         }
         im.hook->end_capture();
 
@@ -1074,10 +1227,45 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             im.source.set_row_tensors(std::move(rows), row_budget);
         }
 
+        if (cfg.gpu.expert_cache_mb > 0) {
+            std::string pool_error;
+            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, layers, pool_error))
+                return fail("GPU expert cache: " + pool_error);
+            im.gpu_recent_miss.assign(layers.size() * size_t(n_expert), 0);
+            im.gpu_queued.assign(layers.size() * size_t(n_expert), 0);
+            ggml_init_params metadata_params{};
+            metadata_params.mem_size = ggml_tensor_overhead() * (layers.size() * 8 + 16);
+            metadata_params.no_alloc = true;
+            im.gpu_expert_metadata.reset(ggml_init(metadata_params));
+            if (!im.gpu_expert_metadata) return fail("GPU expert cache metadata allocation failed");
+            im.gpu_expert_layers.resize(layers.size());
+            for (size_t il = 0; il < layers.size(); ++il) {
+                if (!layers[il].bound) continue;
+                auto & descriptor = im.gpu_expert_layers[il];
+                descriptor.gate = im.gpu_experts.make_weight_tensor(im.gpu_expert_metadata.get(), int(il), 0);
+                descriptor.up = im.gpu_experts.make_weight_tensor(im.gpu_expert_metadata.get(), int(il), 1);
+                descriptor.down = im.gpu_experts.make_weight_tensor(im.gpu_expert_metadata.get(), int(il), 2);
+                descriptor.host_table = im.gpu_experts.make_host_table(im.gpu_expert_metadata.get(), int(il));
+                descriptor.device_table = im.gpu_experts.make_device_table(im.gpu_expert_metadata.get(), int(il));
+                descriptor.dummy_slot = 0;
+                if (!descriptor.gate || !descriptor.up || !descriptor.down || !descriptor.host_table ||
+                    !descriptor.device_table)
+                    return fail("GPU expert cache requires split gate/up/down tensors in every bound MoE layer");
+            }
+            std::fprintf(stderr,
+                         "bmoe: GPU expert cache bridge: %zu MiB reserved, "
+                         "%zu MiB slot layout, %zu real slots\n",
+                         im.gpu_experts.allocated_bytes() >> 20, im.gpu_experts.planned_bytes() >> 20,
+                         im.gpu_experts.capacity());
+        }
         if (im.prefill) im.prefill->keep_stream_layout(layers, offs.shard_paths);
         if (!im.source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe))
             return fail("expert stream source init failed");
         im.hook->set_source(&im.source);
+        if (cfg.gpu.expert_cache_mb > 0) {
+            im.hook->set_gpu_expert_pool(&im.gpu_experts);
+            if (cfg.gpu.expert_cache_promote) im.gpu_worker = std::thread([&im] { im.run_gpu_worker(); });
+        }
         // The row policy exists only once dense_.init has taken the tables over; null means nothing
         // qualified or the takeover declined, and the hook then costs exactly nothing per node.
         im.hook->set_row_source(im.source.row_source());
@@ -1766,7 +1954,7 @@ RunResult Session::generate(const GenerateRequest & req,
         const double overhead = secs(loop_mark, s0); // everything since the previous decode returned
         loop_overhead_s += overhead;
         trace_begin(n_past, /*n_tokens*/ 1 + n_draft, /*phase*/ 1);
-        int dec = llama_decode(ctx, step);
+        int dec = im.decode_target(ctx, step);
         auto s1 = clock_t_::now();
         loop_mark = s1; // the next token's overhead is measured from here
         const uint64_t f1 = pio::major_faults();

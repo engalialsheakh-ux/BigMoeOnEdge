@@ -42,7 +42,7 @@ core/
                   port (prompt split, choice scoring, IPrefixCache), plus one llama.cpp adapter
     metrics/    csv_metrics_sink, route_trace_sink, decode_trace_sink
 third_party/
-  llama.cpp     upstream submodule; public-API consumer, plus one optional overlap hook
+  llama.cpp     pinned fork; public-API consumer plus optional expert-cache hooks
 tests/          byte-identity gates
 examples/android an APK that drives bmoe-cli via ProcessBuilder
 ```
@@ -54,8 +54,12 @@ fetched.
 
 On a CUDA-enabled host build, `Session::open` optionally selects one GPU for llama.cpp's dense
 layers and KV state. The same MoE recipe and expert stream continue to feed CPU expert tensors;
-the router retrieves CUDA-backed top-k IDs through ggml's public tensor-copy API. GPU-owned dense
-weights are left under llama.cpp's backend instead of being rebound into host anonymous memory.
+the router retrieves CUDA-backed top-k IDs through ggml's public tensor-copy API. With an explicit
+GPU expert-cache budget, a bounded device pool adds a CUDA path for cached expert hits while CPU
+serves misses in the same MoE layer. The two output rows are added before the original router
+weighting. GPU-owned dense weights are left under llama.cpp's backend instead of being rebound
+into host anonymous memory. The opt-in mixed graph needs the narrow pinned-fork extension in
+[seam.md](seam.md).
 The CUDA placement and its current restrictions are described in [cuda-hybrid.md](cuda-hybrid.md).
 
 ## Why the streaming seam needs no fork

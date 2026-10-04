@@ -99,6 +99,12 @@ public:
     void retain(int il, const int32_t * ids, int n_ids) override;
     void settle_spec() override;
     void query_residency(int il, const int32_t * ids, int n_ids, uint8_t * out) const override;
+    // Eval-thread only, after decode has completed. Exposes an already-resident
+    // exact bundle for a bounded VRAM promotion; never starts another file read.
+    bool resident_bundle(int il,
+                         int expert,
+                         const void * bytes[MoeRecipe::max_exps],
+                         size_t sizes[MoeRecipe::max_exps]) const;
     uint64_t expert_bytes(int il) const override;
     Stats stats() const override;
 

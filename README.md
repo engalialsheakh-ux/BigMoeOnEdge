@@ -98,11 +98,12 @@ the phone's flash storage. Prefill can optionally run on a Snapdragon's Hexagon 
 layers at a time, which is several times faster on long prompts
 ([docs/npu-prefill.md](docs/npu-prefill.md)).
 
-The same engine builds unmodified on desktop, where a model past RAM streams from the SSD out of
-the box. A CUDA-enabled Windows host build can optionally place dense work and KV state on the GPU
-while the routed experts continue to stream through CPU memory. It is opt-in and measured separately
-from the phone results below; see [hybrid CUDA decode](docs/cuda-hybrid.md). Phones stay the focus,
-because that is where memory is tightest.
+The same engine builds on desktop, where a model past RAM streams from the SSD out of the box.
+A CUDA-enabled Windows host build can optionally place dense work and KV state on the GPU; an
+explicit VRAM expert-cache budget additionally executes cached routed experts on CUDA while CPU
+serves misses. This is opt-in and measured separately from the phone results below; see
+[hybrid CUDA decode](docs/cuda-hybrid.md). Phones stay the focus, because that is where memory is
+tightest.
 
 ## Try it on your phone
 

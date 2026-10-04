@@ -905,6 +905,22 @@ void ExpertStreamSource::query_residency(int il, const int32_t * ids, int n_ids,
     }
 }
 
+bool ExpertStreamSource::resident_bundle(int il,
+                                         int expert,
+                                         const void * bytes[MoeRecipe::max_exps],
+                                         size_t sizes[MoeRecipe::max_exps]) const {
+    if (!active_ || cache_max_ == 0 || il < 0 || il >= n_layer_ || !layers_[il].bound || expert < 0 ||
+        expert >= n_expert_ || !cvalid_[size_t(il) * size_t(n_expert_) + size_t(expert)])
+        return false;
+    for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+        const size_t slice = size_t(layers_[il].proj[p].nb2);
+        if (!slice || !lbuf_[p][il]) return false;
+        bytes[p] = static_cast<const char *>(lbuf_[p][il]) + size_t(expert) * slice;
+        sizes[p] = slice;
+    }
+    return true;
+}
+
 uint64_t ExpertStreamSource::expert_bytes(int il) const {
     if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound) return 0;
     return (uint64_t) entry_bytes(il);

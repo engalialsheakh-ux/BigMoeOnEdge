@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.30.0] - 2026-10-02
+
+### Added
+- An opt-in bounded VRAM expert cache for full CUDA hybrid decode. Ready hits execute
+  gate/up/down on CUDA, while misses keep the existing RAM/SSD-backed CPU streaming
+  path in the same MoE layer. A short recurrence gate admits hot experts to the GPU;
+  bounded background staging uploads complete bundles for later tokens. Prefill keeps
+  its original path, and `--gpu-expert-no-promote` provides an all-miss control.
+- A mixed CPU/CUDA regression gate covering all-miss, all-hit, multithreaded CPU
+  misses, and a changed expert-to-slot map. The local pinned llama.cpp fork delta
+  supplies the narrow mixed graph bridge and handles repeated dummy-slot IDs in
+  CUDA's fallback expert sorter. See [docs/cuda-hybrid.md](docs/cuda-hybrid.md) and
+  [docs/seam.md](docs/seam.md).
+
 ## [0.29.0] - 2026-10-01
 
 ### Added

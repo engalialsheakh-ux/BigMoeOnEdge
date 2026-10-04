@@ -529,6 +529,8 @@ static void print_usage(const char * argv0) {
         "                          but changes the output (quality). 0 = model default\n"
         "      --n-gpu-layers N    CUDA layers: 0=CPU (default), -1=all eligible, N=partial\n"
         "      --main-gpu N        CUDA device index (default 0)\n"
+        "      --gpu-expert-cache-mb N  reserve N MiB of dedicated VRAM for expert slots (default 0)\n"
+        "      --gpu-expert-no-promote  keep the VRAM pool empty for an all-miss correctness probe\n"
         "      --no-kv-offload     keep KV and KQV operations on CPU\n"
         "      --flash-attn M      auto (default) | on | off\n"
         "  -h, --help              show this text and exit\n"
@@ -778,6 +780,10 @@ int main(int argc, char ** argv) {
             cfg.gpu.n_gpu_layers = gpu_int(a.c_str());
         else if (a == "--main-gpu" || a == "-mg")
             cfg.gpu.main_gpu = gpu_int(a.c_str());
+        else if (a == "--gpu-expert-cache-mb")
+            cfg.gpu.expert_cache_mb = gpu_int(a.c_str());
+        else if (a == "--gpu-expert-no-promote")
+            cfg.gpu.expert_cache_promote = false;
         else if (a == "--no-kv-offload")
             cfg.gpu.kv_offload = false;
         else if (a == "--flash-attn") {

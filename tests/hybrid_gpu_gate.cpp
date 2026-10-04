@@ -7,7 +7,7 @@
 #include <string>
 
 int main(int argc, char ** argv) {
-    if (argc < 2 || argc > 4) return 2;
+    if (argc < 2 || argc > 5) return 2;
 
     llama_backend_init();
     bool gpu_available = false;
@@ -34,9 +34,14 @@ int main(int argc, char ** argv) {
     streamed.moe.io_threads = 2;
     streamed.moe.dense_weights = bmoe::DenseWeightsMode::Anonymous;
     if (argc >= 3) streamed.moe.cache_mb = std::stoi(argv[2]);
+    if (argc >= 5) streamed.gpu.expert_cache_mb = std::stoi(argv[4]);
+    // Keep the byte-identity gate all-miss; mixed CPU/CUDA arithmetic has a
+    // separate numerical gate and real-model smoke test.
+    if (streamed.gpu.expert_cache_mb > 0) streamed.gpu.expert_cache_promote = false;
     const int requested_cache_mb = streamed.moe.cache_mb;
-    std::printf("hybrid GPU gate: serial cache=%d MiB, KV=%s\n", requested_cache_mb,
-                streamed.gpu.kv_offload ? "GPU" : "CPU");
+    std::printf("hybrid GPU gate: serial RAM cache=%d MiB, GPU expert pool=%d MiB, KV=%s, promotion=%s\n",
+                requested_cache_mb, streamed.gpu.expert_cache_mb, streamed.gpu.kv_offload ? "GPU" : "CPU",
+                streamed.gpu.expert_cache_promote ? "on" : "off");
     std::fflush(stdout);
 
     const bmoe::RunResult reference = bmoe::run(resident);
@@ -72,8 +77,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "hybrid overlap cache differs from requested %d MiB\n", requested_cache_mb);
         return 1;
     }
-    std::printf("hybrid GPU gate: overlap cache=%d MiB, KV=%s\n", streamed.moe.cache_mb,
-                streamed.gpu.kv_offload ? "GPU" : "CPU");
+    std::printf("hybrid GPU gate: overlap RAM cache=%d MiB, GPU expert pool=%d MiB, KV=%s, promotion=%s\n",
+                streamed.moe.cache_mb, streamed.gpu.expert_cache_mb, streamed.gpu.kv_offload ? "GPU" : "CPU",
+                streamed.gpu.expert_cache_promote ? "on" : "off");
     std::fflush(stdout);
     const bmoe::RunResult overlap = bmoe::run(streamed);
     if (!overlap || overlap.generated_text != reference.generated_text || overlap.summary.moe_read_mib <= 0.0) {
@@ -85,6 +91,7 @@ int main(int argc, char ** argv) {
 #endif
     bmoe::RunConfig partial = streamed;
     partial.gpu.n_gpu_layers = 1;
+    partial.gpu.expert_cache_mb = 0;
     partial.moe.release_mmap = true;
     partial.moe.require_release_mmap = true;
     const bmoe::RunResult unsafe_release = bmoe::run(partial);

@@ -487,6 +487,8 @@ struct RunConfig {
         enum class FlashAttention { Auto, On, Off };
         int n_gpu_layers = 0;
         int main_gpu = 0;
+        int expert_cache_mb = 0;          // persistent CUDA expert storage; zero disables it
+        bool expert_cache_promote = true; // control for all-miss correctness probes
         bool kv_offload = true;
         FlashAttention flash_attn = FlashAttention::Auto;
     } gpu;

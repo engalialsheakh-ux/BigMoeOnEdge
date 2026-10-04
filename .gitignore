@@ -58,3 +58,4 @@ keystore.properties
 # and .so binaries as untracked, which is exactly what the never-'git add -A' rule exists to
 # survive.
 .claude/
+graphify-out/

@@ -683,6 +683,18 @@ gap is O_DIRECT alignment waste, and `read_bytes` is what effective bandwidth mu
 against. `spec=1` marks a speculative prefetch read. Rows are stamped with the decode they were
 drained after, so a read straddling a token boundary is attributed to the decode that flushed it.
 
+### VRAM expert-cache diagnostic
+
+When `--gpu-expert-cache-mb` is positive, session teardown prints one
+`bmoe-gpu-cache:` line to stderr. `gpu_expert_hits` and `cpu_expert_misses`
+count selected expert contributions, including the initial all-miss token;
+their sum should equal the routed top-k count across generated tokens.
+`gpu_promotions` counts complete bundles published for later tokens,
+`gpu_evictions` counts displaced ready slots, and `gpu_cache_resident` is the
+number of ready bundles at teardown. `gpu_upload_mib` and `gpu_upload_ms`
+measure the bytes and wall time spent by the bounded background uploader.
+These counters do not change the CSV schemas or the `BMOE_*` protocol.
+
 ### Reading them
 
 `scripts/decode-analyze.py` (stdlib only) reports what each file is for:

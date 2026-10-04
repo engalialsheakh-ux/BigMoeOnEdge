@@ -69,6 +69,19 @@ int main() {
     }
     {
         RunConfig c = ok_moe();
+        c.gpu.expert_cache_mb = 512;
+        expect_fail("VRAM expert cache needs full GPU placement", c);
+        c.gpu.n_gpu_layers = 1;
+        expect_fail("VRAM expert cache rejects partial placement", c);
+        c.gpu.n_gpu_layers = -1;
+        expect_ok("VRAM expert cache with full GPU placement", c);
+        c.moe.enabled = false;
+        expect_fail("VRAM expert cache needs streaming", c);
+        c.gpu.expert_cache_mb = -1;
+        expect_fail("negative VRAM expert cache budget", c);
+    }
+    {
+        RunConfig c = ok_moe();
         c.moe.require_release_mmap = true;
         expect_fail("strict mapping release needs release-mmap", c);
         c.moe.release_mmap = true;

@@ -53,7 +53,7 @@ without loading any tensor data. We match these to the captured tensors by name.
 Sections 1 and 2 are enough for the *serial* streamer: block on the expert reads, then let
 the layer compute. Overlapping the two — reading a token's experts while the same token's
 expert matmuls are running — needs a wait point that no public API exposes. That is the one
-place where BigMoeOnEdge carries a llama.cpp extension.
+place where the released BigMoeOnEdge pin carries a llama.cpp extension.
 
 **What it is.** A single optional hook, ~25 lines, living on the fork branch
 `bmoe/expert-ready-hook` of `Helldez/llama.cpp` as a single commit on top of the upstream
@@ -87,10 +87,37 @@ whole project still compiles and runs — the serial streaming path is unchanged
 `--overlap` is affected, and it fails with a clear runtime error instead of silently
 falling back.
 
-**Sunset condition.** This fork exists *solely* for this one hook. The moment upstream
-ships an equivalent per-expert readiness/residency callback, the branch is dropped and the
-submodule bumps straight back to `ggml-org/llama.cpp`. It is a tide-me-over until the wait
-point is public, not a divergence we intend to maintain.
+**Sunset condition.** The released fork carries this hook until upstream exposes an
+equivalent per-expert readiness callback. The GPU expert-cache work below is an additional
+opt-in local fork delta and must be reviewed before any submodule bump.
+
+## Experimental mixed CPU/CUDA expert cache
+
+The local GPU-cache worktree extends the pinned `ggml-cpu.c` `MUL_MAT_ID` kernel with an
+optional `src[3]` I32 table indexed by original expert ID. `op_params[0]` gives the dummy
+GPU slot. A routed ID whose table entry differs from that dummy is a GPU hit: thread zero
+zeros the corresponding CPU destination row and omits it from the kernel's expert work
+list. The existing expert-ready hook therefore runs only for CPU misses. A null `src[3]`
+keeps the released kernel behavior. The standalone `cpu_expert_skip` gate checks the zero
+rows, exact miss output, and hook calls with distinct expert weights.
+
+The local `llama_set_expert_cache_layers` extension gives the one-token split
+gate/up/down SiLU graph stable external weight and mapping tensors. The graph runs
+the CPU miss path and a CUDA hit path, adds their rows, then applies the original
+router weights. Other graph forms keep the original CPU expert path. The session
+attaches the descriptors only for one-token decode, keeps their metadata alive until
+after `llama_context`, and changes a layer's map at the top-k barrier before either
+expert branch consumes it. Selected hit slots stay pinned through `llama_decode()`;
+the map is cleared before unpinning. Promotion uses only an already-resident RAM
+bundle, copied into bounded staging after the token, and publishes the GPU slot only
+after all projections upload. The focused `gpu_expert_mixed` gate covers all miss,
+mixed, all hit, multithreaded CPU execution, and a changing map.
+
+The CUDA fallback `MUL_MAT_ID` sorter in this pinned version assumed each selected
+slot occurred once. Multiple misses share dummy slot zero, so the local CUDA delta
+retains every occurrence when sorting the rows. The all-miss case in
+`gpu_expert_mixed` catches a regression. All of these changes remain uncommitted in
+the submodule working tree; the parent submodule pin still names the earlier commit.
 
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 

@@ -4,12 +4,13 @@
 # and on llama.cpp's PUBLIC C API (llama.h / ggml.h). The serial streaming path never
 # touches llama.cpp internals: MoE expert streaming is driven entirely through the public
 # eval-callback and public gguf accessors, so it tracks upstream with nothing more than a
-# submodule pointer bump — no in-tree patch. The one exception is the optional `--overlap`
+# submodule pointer bump — no in-tree patch. The released exception is the optional `--overlap`
 # feature, which needs a per-expert wait point the public API does not expose: the submodule
 # pins a fork branch (`bmoe/expert-ready-hook` on Helldez/llama.cpp) adding one ~25-line
 # readiness hook, detected here as BMOE_HAVE_EXPERT_READY_HOOK. It is zero-cost when absent,
 # the serial path still builds against stock upstream, and it sunsets the moment upstream
-# ships an equivalent callback. See docs/seam.md § 3.
+# ships an equivalent callback. The uncommitted GPU expert-cache prototype adds an opt-in
+# CPU hit-skip experiment to that pin; see docs/seam.md for its exact seam.
 #
 # llama.cpp is an optional dependency at configure time: when the submodule is absent
 # only the pure-policy code (config validation) compiles, so the scaffold and a subset
