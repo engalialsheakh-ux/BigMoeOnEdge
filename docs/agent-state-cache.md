@@ -37,8 +37,9 @@ decode throughput relative to dynamic promotions.
 The checkpoint captures both attention KV and recurrent/SSM state through
 llama.cpp's public sequence-state API. A focused gate mutates the state, restores
 it twice, checks recurrent-state bytes, and compares subsequent logits. The
-integration gate checks in-process reuse, restart reuse, a changed prefix, and a
-corrupt file. Creating a checkpoint splits the cold prompt at its boundary;
+integration gate checks in-process reuse, restart reuse, a changed prefix,
+an incompatible execution setting, and a corrupt file. Creating a checkpoint
+splits the cold prompt at its boundary;
 floating-point execution can therefore differ from an unsplit prompt. The exact
 comparison for cache correctness is between the checkpoint-producing cold run
 and the same run after restore. No experts are skipped and no model math changes.

@@ -230,17 +230,23 @@ int main(int argc, char ** argv) {
         const bmoe::RunResult rejected = after_corruption ? after_corruption->generate(req) : bmoe::RunResult{};
         req.prompt[0] = 'b';
         const bmoe::RunResult mismatch = after_corruption ? after_corruption->generate(req) : bmoe::RunResult{};
+        after_corruption.reset();
+        req.prompt = cfg.prompt;
+        cfg.n_threads = 3; // different execution configuration invalidates the saved state
+        auto changed_config = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+        const bmoe::RunResult incompatible = changed_config ? changed_config->generate(req) : bmoe::RunResult{};
         std::filesystem::remove(checkpoint, ec);
-        if (!cold || !warm || !persisted || !rejected || !mismatch || cold.generated_text != warm.generated_text ||
-            cold.generated_text != persisted.generated_text || cold.summary.n_prompt <= warm.summary.n_prompt ||
-            cold.summary.n_prompt <= persisted.summary.n_prompt || rejected.summary.n_prompt != cold.summary.n_prompt ||
-            mismatch.summary.n_prompt != cold.summary.n_prompt) {
+        if (!cold || !warm || !persisted || !rejected || !mismatch || !incompatible ||
+            cold.generated_text != warm.generated_text || cold.generated_text != persisted.generated_text ||
+            cold.summary.n_prompt <= warm.summary.n_prompt || cold.summary.n_prompt <= persisted.summary.n_prompt ||
+            rejected.summary.n_prompt != cold.summary.n_prompt || mismatch.summary.n_prompt != cold.summary.n_prompt ||
+            incompatible.summary.n_prompt != cold.summary.n_prompt) {
             std::fprintf(stderr,
-                         "agent state cache mismatch: error=%s, prefix work cold/warm/disk/miss=%d/%d/%d/%d, "
+                         "agent state cache mismatch: error=%s, prefix work cold/warm/disk/miss/config=%d/%d/%d/%d/%d, "
                          "output equality cold-warm/cold-disk=%d/%d\n",
                          error.c_str(), cold.summary.n_prompt, warm.summary.n_prompt, persisted.summary.n_prompt,
-                         mismatch.summary.n_prompt, cold.generated_text == warm.generated_text,
-                         cold.generated_text == persisted.generated_text);
+                         mismatch.summary.n_prompt, incompatible.summary.n_prompt,
+                         cold.generated_text == warm.generated_text, cold.generated_text == persisted.generated_text);
             ok = false;
         }
     }
