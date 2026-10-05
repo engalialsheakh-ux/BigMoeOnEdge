@@ -513,6 +513,8 @@ static void print_usage(const char * argv0) {
         "      --no-think          render the chat template with reasoning disabled\n"
         "      --progress          emit machine telemetry (one JSON line per token)\n"
         "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
+        "      --agent-state-cache FILE  save one exact hybrid prefix checkpoint and reuse it\n"
+        "                          across requests and process restarts when tokens/config match\n"
         "      --decide            with --session: accept decide requests (pick one of a list of\n"
         "                          choices from a single prefill, no decode). Off by default\n"
         "      --decide-prefix-cache M\n"
@@ -841,6 +843,8 @@ int main(int argc, char ** argv) {
                 cfg.gpu.cache_type_k = type;
             else
                 cfg.gpu.cache_type_v = type;
+        } else if (a == "--agent-state-cache") {
+            cfg.agent_state_cache_path = next(a.c_str());
         } else if (a == "--flash-attn") {
             const std::string mode = next("--flash-attn");
             if (mode == "auto")

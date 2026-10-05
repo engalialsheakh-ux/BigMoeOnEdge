@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -79,20 +81,41 @@ static bool check_case(llama_model * model, int n_tokens, int tile_tokens = 512)
         return false;
     }
 
-    llama_token next = 15;
-    if (llama_decode(reference.get(), llama_batch_get_one(&next, 1)) != 0 ||
-        llama_decode(tiled.get(), llama_batch_get_one(&next, 1)) != 0) {
-        std::fprintf(stderr, "post-tile decode failed at %d tokens\n", n_tokens);
+    // A hybrid checkpoint must restore recurrent state as well as attention KV. Mutate the
+    // live context, restore the same snapshot twice, and compare its continuation each time.
+    const size_t state_size = llama_state_seq_get_size(tiled.get(), 0);
+    if (state_size == 0) return false;
+    std::vector<uint8_t> checkpoint(state_size);
+    if (llama_state_seq_get_data(tiled.get(), checkpoint.data(), checkpoint.size(), 0) != state_size) return false;
+    const size_t recurrent_size = llama_state_seq_get_size_ext(tiled.get(), 0, partial);
+    std::vector<uint8_t> recurrent_before(recurrent_size), recurrent_after(recurrent_size);
+    if (recurrent_size == 0 || llama_state_seq_get_data_ext(tiled.get(), recurrent_before.data(), recurrent_size, 0,
+                                                            partial) != recurrent_size)
         return false;
-    }
-    if (std::memcmp(llama_get_logits(reference.get()), llama_get_logits(tiled.get()), logit_bytes) != 0) {
+    llama_token mutation = 31;
+    if (llama_decode(tiled.get(), llama_batch_get_one(&mutation, 1)) != 0) return false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (llama_state_seq_set_data(tiled.get(), checkpoint.data(), checkpoint.size(), 0) == 0 ||
+            llama_state_seq_get_size_ext(tiled.get(), 0, partial) != recurrent_size ||
+            llama_state_seq_get_data_ext(tiled.get(), recurrent_after.data(), recurrent_size, 0, partial) !=
+                recurrent_size ||
+            recurrent_before != recurrent_after) {
+            std::fprintf(stderr, "hybrid recurrent state did not restore at %d tokens (attempt %d)\n", n_tokens,
+                         attempt + 1);
+            return false;
+        }
+        llama_token next = 15;
+        if (llama_decode(tiled.get(), llama_batch_get_one(&next, 1)) != 0) return false;
+        if (attempt == 0 && llama_decode(reference.get(), llama_batch_get_one(&next, 1)) != 0) return false;
         const float * a = llama_get_logits(reference.get());
         const float * b = llama_get_logits(tiled.get());
         float max_delta = 0.0f;
         for (size_t i = 0; i < n_vocab; ++i)
             max_delta = std::max(max_delta, std::fabs(a[i] - b[i]));
-        std::fprintf(stderr, "post-tile decode differs at %d tokens: max delta=%g\n", n_tokens, max_delta);
-        if (max_delta > 1.0e-6f) return false;
+        if (max_delta > 1.0e-6f) {
+            std::fprintf(stderr, "post-restore decode differs at %d tokens: max delta=%g\n", n_tokens, max_delta);
+            return false;
+        }
     }
     return true;
 }
@@ -170,6 +193,54 @@ int main(int argc, char ** argv) {
                          first_ref.generated_text.c_str(), second_ref.generated_text.c_str(),
                          first_auto.generated_text.c_str(), second_auto.generated_text.c_str(),
                          second_ref.summary.n_prompt, second_auto.summary.n_prompt);
+            ok = false;
+        }
+    }
+    if (ok) {
+        const std::string checkpoint = std::string(argv[1]) + ".agent-state-gate";
+        std::error_code ec;
+        std::filesystem::remove(checkpoint, ec);
+        bmoe::RunConfig cfg;
+        cfg.model_path = argv[1];
+        cfg.prompt = std::string(700, 'a');
+        cfg.n_ctx = 1024;
+        cfg.n_predict = 8;
+        cfg.agent_state_cache_path = checkpoint;
+        std::string error;
+        auto session = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+        bmoe::GenerateRequest req;
+        req.prompt = cfg.prompt;
+        req.n_predict = cfg.n_predict;
+        const bmoe::RunResult cold = session ? session->generate(req) : bmoe::RunResult{};
+        const bmoe::RunResult warm = session ? session->generate(req) : bmoe::RunResult{};
+        session.reset();
+        auto reopened = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+        const bmoe::RunResult persisted = reopened ? reopened->generate(req) : bmoe::RunResult{};
+        reopened.reset();
+        {
+            std::fstream file(checkpoint, std::ios::binary | std::ios::in | std::ios::out);
+            file.seekg(-1, std::ios::end);
+            char byte = 0;
+            file.read(&byte, 1);
+            file.seekp(-1, std::ios::end);
+            byte ^= 1;
+            file.write(&byte, 1);
+        }
+        auto after_corruption = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+        const bmoe::RunResult rejected = after_corruption ? after_corruption->generate(req) : bmoe::RunResult{};
+        req.prompt[0] = 'b';
+        const bmoe::RunResult mismatch = after_corruption ? after_corruption->generate(req) : bmoe::RunResult{};
+        std::filesystem::remove(checkpoint, ec);
+        if (!cold || !warm || !persisted || !rejected || !mismatch || cold.generated_text != warm.generated_text ||
+            cold.generated_text != persisted.generated_text || cold.summary.n_prompt <= warm.summary.n_prompt ||
+            cold.summary.n_prompt <= persisted.summary.n_prompt || rejected.summary.n_prompt != cold.summary.n_prompt ||
+            mismatch.summary.n_prompt != cold.summary.n_prompt) {
+            std::fprintf(stderr,
+                         "agent state cache mismatch: error=%s, prefix work cold/warm/disk/miss=%d/%d/%d/%d, "
+                         "output equality cold-warm/cold-disk=%d/%d\n",
+                         error.c_str(), cold.summary.n_prompt, warm.summary.n_prompt, persisted.summary.n_prompt,
+                         mismatch.summary.n_prompt, cold.generated_text == warm.generated_text,
+                         cold.generated_text == persisted.generated_text);
             ok = false;
         }
     }

@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.34.0] - 2026-10-06
+
+### Added
+- Add an optional persistent hybrid agent-prefix checkpoint for the Windows CLI.
+  Matching requests restore attention KV and recurrent state, skip the saved
+  prompt tokens, and reject changed or corrupt snapshots. The feature is opt-in
+  with `--agent-state-cache FILE`; see `docs/agent-state-cache.md`.
+
 ## [0.33.0] - 2026-10-05
 
 ### Added

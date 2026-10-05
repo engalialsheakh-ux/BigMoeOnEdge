@@ -21,7 +21,7 @@ cmake_minimum_required(VERSION 3.21)
 # --version, and the run-parameter preamble of every metrics CSV), so a committed benchmark file
 # says which engine produced it. Keep it in step with CHANGELOG.md; the Android app version
 # advances separately when an app release includes the change.
-project(bigmoeonedge VERSION 0.31.0 LANGUAGES CXX)
+project(bigmoeonedge VERSION 0.34.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

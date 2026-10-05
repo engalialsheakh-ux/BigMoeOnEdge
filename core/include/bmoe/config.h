@@ -442,6 +442,8 @@ struct DecideConfig {
 // A full run: model, prompt, decoding, streaming, telemetry.
 struct RunConfig {
     std::string model_path;
+    // Optional single hybrid sequence checkpoint file for repeated agent prompts.
+    std::string agent_state_cache_path;
     std::string prompt = "The capital of Japan is";
     int n_predict = 128;
     int n_threads = 4;

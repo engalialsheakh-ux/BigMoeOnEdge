@@ -40,13 +40,23 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace bmoe {
 
@@ -254,12 +264,167 @@ int prefill_piece(const SessionConfig & cfg) {
     return cfg.n_ubatch > 0 ? std::min(cfg.n_ubatch, cfg.n_batch) : cfg.n_batch;
 }
 
+uint64_t hash_bytes(uint64_t h, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h ^= bytes[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+uint64_t agent_state_key(const SessionConfig & cfg) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path model = fs::weakly_canonical(fs::path(cfg.model_path), ec);
+    if (ec) return 0;
+    const uintmax_t size = fs::file_size(model, ec);
+    if (ec) return 0;
+    const auto modified = fs::last_write_time(model, ec);
+    if (ec) return 0;
+
+    // The file identity catches normal replacement. Sampled content also catches timestamp-only
+    // copies without reading the entire >RAM model once more on every process start.
+    uint64_t h = 14695981039346656037ull;
+    const std::string identity =
+        model.string() + "|" + std::to_string(size) + "|" + std::to_string(modified.time_since_epoch().count());
+    h = hash_bytes(h, identity.data(), identity.size());
+    std::ifstream file(model, std::ios::binary);
+    if (!file) return 0;
+    std::array<char, 65536> sample{};
+    for (uintmax_t offset : {uintmax_t(0), size / 2, size > sample.size() ? size - sample.size() : uintmax_t(0)}) {
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(offset));
+        file.read(sample.data(), static_cast<std::streamsize>(sample.size()));
+        if (file.bad()) return 0;
+        h = hash_bytes(h, sample.data(), static_cast<size_t>(file.gcount()));
+    }
+
+    std::ostringstream settings;
+    settings << "agent-state-v1|" << version() << '|' << LLAMA_STATE_SEQ_VERSION << '|' << cfg.n_ctx << '|'
+             << cfg.n_batch << '|' << cfg.n_ubatch << '|' << cfg.layer_tile_tokens << '|' << cfg.n_threads << '|'
+             << cfg.n_expert_used << '|' << cfg.gpu.n_gpu_layers << '|' << cfg.gpu.main_gpu << '|' << cfg.gpu.kv_offload
+             << '|' << int(cfg.gpu.flash_attn) << '|' << int(cfg.gpu.cache_type_k) << '|' << int(cfg.gpu.cache_type_v)
+             << '|' << cfg.moe.enabled << '|' << cfg.moe.cache_mb << '|' << cfg.moe.overlap << '|'
+             << cfg.moe.drop_cold_frac << '|' << cfg.moe.substitute_lambda << '|' << cfg.moe.route_ahead << '|'
+             << cfg.prefill.device << '|' << cfg.prefill.min_tokens << '|' << cfg.prefill.routed << '|'
+             << cfg.prefill.routed_full_frac << '|';
+    const std::string serialized = settings.str();
+    return hash_bytes(h, serialized.data(), serialized.size());
+}
+
+struct AgentStateCache {
+    static constexpr size_t max_state_bytes = 1024ull * 1024ull * 1024ull;
+    std::string path;
+    uint64_t key = 0;
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t> state;
+    bool disk_checked = false;
+    bool restore_failed = false;
+
+    bool matches(const std::vector<llama_token> & prompt) const {
+        return !state.empty() && !tokens.empty() && tokens.size() < prompt.size() &&
+               std::equal(tokens.begin(), tokens.end(), prompt.begin());
+    }
+
+    void read_disk() {
+        disk_checked = true;
+        if (path.empty() || key == 0) return;
+        std::ifstream in(path, std::ios::binary | std::ios::ate);
+        if (!in) return;
+        const std::streamoff file_bytes = in.tellg();
+        if (file_bytes < 0 || uint64_t(file_bytes) > max_state_bytes + 1024ull * 1024ull) return;
+        in.seekg(0);
+        char magic[8];
+        uint64_t stored_key = 0, state_size = 0, checksum = 0;
+        uint32_t token_count = 0;
+        in.read(magic, sizeof(magic));
+        in.read(reinterpret_cast<char *>(&stored_key), sizeof(stored_key));
+        in.read(reinterpret_cast<char *>(&token_count), sizeof(token_count));
+        in.read(reinterpret_cast<char *>(&state_size), sizeof(state_size));
+        in.read(reinterpret_cast<char *>(&checksum), sizeof(checksum));
+        const uint64_t header_bytes =
+            sizeof(magic) + sizeof(stored_key) + sizeof(token_count) + sizeof(state_size) + sizeof(checksum);
+        if (!in || std::memcmp(magic, "BMOEAS01", 8) != 0 || stored_key != key || token_count == 0 ||
+            token_count > 262144 || state_size == 0 || state_size > max_state_bytes ||
+            uint64_t(file_bytes) != header_bytes + uint64_t(token_count) * sizeof(llama_token) + state_size)
+            return;
+        std::vector<llama_token> loaded_tokens(token_count);
+        std::vector<uint8_t> loaded_state(static_cast<size_t>(state_size));
+        in.read(reinterpret_cast<char *>(loaded_tokens.data()), std::streamsize(token_count * sizeof(llama_token)));
+        in.read(reinterpret_cast<char *>(loaded_state.data()), std::streamsize(state_size));
+        const uint64_t token_hash =
+            hash_bytes(14695981039346656037ull, loaded_tokens.data(), loaded_tokens.size() * sizeof(llama_token));
+        if (!in || hash_bytes(token_hash, loaded_state.data(), loaded_state.size()) != checksum) return;
+        tokens = std::move(loaded_tokens);
+        state = std::move(loaded_state);
+    }
+
+    size_t restore(llama_context * ctx, const std::vector<llama_token> & prompt) {
+        restore_failed = false;
+        if (!disk_checked && state.empty()) read_disk();
+        if (!matches(prompt)) return 0;
+        const size_t read = llama_state_seq_set_data(ctx, state.data(), state.size(), 0);
+        if (read != state.size()) {
+            restore_failed = true;
+            state.clear();
+            tokens.clear();
+            return 0;
+        }
+        return tokens.size();
+    }
+
+    bool persist() const {
+        if (path.empty() || key == 0 || state.empty()) return false;
+        const std::string temp = path + ".tmp";
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        const uint32_t token_count = static_cast<uint32_t>(tokens.size());
+        const uint64_t state_size = state.size();
+        const uint64_t token_hash =
+            hash_bytes(14695981039346656037ull, tokens.data(), tokens.size() * sizeof(llama_token));
+        const uint64_t checksum = hash_bytes(token_hash, state.data(), state.size());
+        out.write("BMOEAS01", 8);
+        out.write(reinterpret_cast<const char *>(&key), sizeof(key));
+        out.write(reinterpret_cast<const char *>(&token_count), sizeof(token_count));
+        out.write(reinterpret_cast<const char *>(&state_size), sizeof(state_size));
+        out.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
+        out.write(reinterpret_cast<const char *>(tokens.data()), std::streamsize(tokens.size() * sizeof(llama_token)));
+        out.write(reinterpret_cast<const char *>(state.data()), std::streamsize(state.size()));
+        out.close();
+        if (!out) return false;
+#ifdef _WIN32
+        return MoveFileExW(std::filesystem::path(temp).c_str(), std::filesystem::path(path).c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+        return !ec;
+#endif
+    }
+
+    bool capture(llama_context * ctx, const std::vector<llama_token> & prompt, size_t count) {
+        if (key == 0 || count == 0 || count >= prompt.size()) return false;
+        if (tokens.size() == count && std::equal(tokens.begin(), tokens.end(), prompt.begin())) return false;
+        const size_t bytes = llama_state_seq_get_size(ctx, 0);
+        if (bytes == 0 || bytes > max_state_bytes) return false;
+        std::vector<uint8_t> snapshot(bytes);
+        if (llama_state_seq_get_data(ctx, snapshot.data(), snapshot.size(), 0) != bytes) return false;
+        tokens.assign(prompt.begin(), prompt.begin() + count);
+        state = std::move(snapshot);
+        disk_checked = true;
+        if (!persist()) std::fprintf(stderr, "bmoe: agent state cache could not write %s\n", path.c_str());
+        return true;
+    }
+};
+
 } // namespace
 
 // All native state lives here, behind the pimpl. Built once by Session::open(); every
 // generate() reuses the loaded model, the live context and the warm expert cache.
 struct Session::Impl {
     SessionConfig cfg;
+    AgentStateCache agent_cache;
     std::string arch;
     double load_seconds = 0.0;
 
@@ -864,12 +1029,21 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
          cfg.decide.enabled || cfg.spec.enabled()))
         return fail("CUDA hybrid currently supports exact streaming without row-stream, routing policies, "
                     "speculation, decide, or prefetch");
+    if (!cfg.agent_state_cache_path.empty() &&
+        (cfg.spec.enabled() || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
+         cfg.moe.substitute_lambda > 0.0f || cfg.moe.route_ahead > 0))
+        return fail("agent state cache requires greedy sampling and exact, unspeculated routing");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
     std::unique_ptr<Session> self(new Session());
     Impl & im = *self->impl_;
     im.cfg = cfg;
+    if (!cfg.agent_state_cache_path.empty()) {
+        im.agent_cache.path = cfg.agent_state_cache_path;
+        im.agent_cache.key = agent_state_key(cfg);
+        if (im.agent_cache.key == 0) return fail("agent state cache cannot identify the model file");
+    }
 
     // llama_backend_init/free is process-global and reference counted; init here, free in ~Impl.
     llama_backend_init();
@@ -1740,6 +1914,24 @@ RunResult Session::generate(const GenerateRequest & req,
             llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
     }
 
+    // Agent requests normally start a fresh raw prompt. A matching checkpoint restores the
+    // attention and recurrent state before only the changing suffix is fed to the model.
+    if (req.clear_kv && im.agent_cache.key != 0) {
+        const auto t_restore = clock_t_::now();
+        const size_t restored = im.agent_cache.restore(ctx, tokens);
+        if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1)) {
+            n_common = restored;
+            if (chat_on) im.kv_tokens = im.agent_cache.tokens;
+            std::fprintf(stderr, "bmoe: agent state cache hit: %zu tokens, %.1f MiB, restore %.3f s\n", restored,
+                         double(im.agent_cache.state.size()) / (1024.0 * 1024.0), secs(t_restore, clock_t_::now()));
+        } else if (im.agent_cache.restore_failed || restored) {
+            im.clear_memory(ctx);
+            im.agent_cache.state.clear();
+            im.agent_cache.tokens.clear();
+            std::fprintf(stderr, "bmoe: agent state cache rejected invalid state; prefilling cold\n");
+        }
+    }
+
     // Roll this turn back to the state before it started: drop the KV added this turn, forget the
     // tokens we fed, and un-append the user message. Used on cancel so prior turns stay usable.
     auto rollback_turn = [&]() {
@@ -1847,8 +2039,12 @@ RunResult Session::generate(const GenerateRequest & req,
     const uint64_t arena_read0 = im.prefill ? im.prefill->arena_read_bytes() : 0;
     const double arena_stall0 = im.prefill ? im.prefill->arena_stall_seconds() : 0.0;
     const long long device_nodes0 = im.hook->device_nodes();
-    for (int i = (int) n_common; i < n_prompt; i += pf_step) {
-        const int chunk = std::min(pf_step, n_prompt - i);
+    const size_t checkpoint = im.agent_cache.key == 0 || n_prompt <= 128 ? 0
+                              : n_prompt > 1024                          ? size_t((n_prompt - 1) / 512 * 512)
+                                                                         : size_t((n_prompt - 1) / 64 * 64);
+    for (int i = (int) n_common; i < n_prompt;) {
+        int chunk = std::min(pf_step, n_prompt - i);
+        if (checkpoint > size_t(i) && checkpoint < size_t(i + chunk)) chunk = int(checkpoint) - i;
         if (im.prefill) {
             const bool on_dev = chunk >= im.cfg.prefill.min_tokens;
             im.place_prefill(on_dev);
@@ -1879,6 +2075,14 @@ RunResult Session::generate(const GenerateRequest & req,
         // or the first draft is made from a hidden state that never saw the prompt.
         if (mtp_on && !common_speculative_process(im.mtp.get(), pf))
             return fail("MTP draft context failed to process the prefill batch");
+        i += chunk;
+        if (checkpoint != 0 && size_t(i) == checkpoint) {
+            const auto t_capture = clock_t_::now();
+            if (im.agent_cache.capture(ctx, tokens, checkpoint))
+                std::fprintf(stderr, "bmoe: agent state cache checkpoint: %zu tokens, %.1f MiB, capture %.3f s\n",
+                             checkpoint, double(im.agent_cache.state.size()) / (1024.0 * 1024.0),
+                             secs(t_capture, clock_t_::now()));
+        }
     }
     im.place_prefill(false); // decode reads the host bindings
     const long long prefill_device_nodes = im.hook->device_nodes() - device_nodes0;
