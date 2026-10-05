@@ -75,6 +75,18 @@ bool kv_cache_ggml_type(RunConfig::GpuConfig::KvCacheType type, ggml_type & out)
     return false;
 }
 
+int select_layer_tile(
+    int requested, int prompt_tokens, int batch_tokens, int ubatch, int n_embd, uint64_t available_bytes) {
+    if (requested != -1) return requested;
+    const uint64_t bytes_per_token = uint64_t(n_embd) * sizeof(float);
+    if (ubatch != 64 || bytes_per_token == 0 || available_bytes == 0) return 512;
+    const uint64_t memory_limit = available_bytes / 8 / bytes_per_token;
+    int tile = 512;
+    while (tile < 8192 && tile < prompt_tokens && tile * 2 <= batch_tokens && uint64_t(tile * 2) <= memory_limit)
+        tile *= 2;
+    return tile;
+}
+
 // Graph width for the MTP draft context, and it wants to be SMALL.
 //
 // llama.cpp reserves a context's compute buffers for its widest ubatch, and the dominant term is the
@@ -413,11 +425,11 @@ struct Session::Impl {
                    ? -1
                    : result;
     }
-    int decode_placed(llama_context * c, const llama_batch & b, bool layer_tiled = false) {
+    int decode_placed(llama_context * c, const llama_batch & b, int layer_tile_tokens = 0) {
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
-        const int result = layer_tiled && b.n_tokens > cfg.n_ubatch
-                               ? llama_decode_layer_tiled(c, b, (uint32_t) cfg.layer_tile_tokens)
+        const int result = layer_tile_tokens > 0 && b.n_tokens > cfg.n_ubatch
+                               ? llama_decode_layer_tiled(c, b, (uint32_t) layer_tile_tokens)
                            : prefill ? prefill->decode(c, b)
                                      : llama_decode(c, b);
         if (hook) hook->finish_gpu_decode();
@@ -836,11 +848,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         return fail("GPU expert cache needs MoE streaming and full CUDA layer placement");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
         return fail("GPU layer offload does not combine with prefill.device");
-    if (cfg.layer_tile_tokens != 0 &&
-        (cfg.layer_tile_tokens != 512 || cfg.n_ubatch != 64 || cfg.n_ctx < 512 || cfg.spec.enabled() ||
-         cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled))
-        return fail(
-            "layer-tiled prefill requires 512-token tiles, 64-token ubatches, MoE streaming and full CUDA placement");
+    const int tile = cfg.layer_tile_tokens;
+    if (tile != 0 && (tile != -1 && (tile < 512 || tile > 8192 || (tile & (tile - 1)) != 0) || cfg.n_ubatch != 64 ||
+                      cfg.n_ctx < 512 || cfg.n_batch < 512 || (tile > 0 && tile > std::min(cfg.n_ctx, cfg.n_batch)) ||
+                      cfg.spec.enabled() || cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled))
+        return fail("layer-tiled prefill requires auto or a power-of-two tile from 512 to 8192 within batch/context "
+                    "capacity, 64-token ubatches, MoE streaming and full CUDA placement");
     if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap)
         return fail("require_release_mmap requires release_mmap");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.moe.enabled && cfg.moe.overlap && cfg.moe.cache_mb == 0 && !cfg.moe.cache_auto)
@@ -1809,6 +1822,21 @@ RunResult Session::generate(const GenerateRequest & req,
     // context it never uses.
     const bool spec_on = im.cfg.spec.enabled();
     const bool mtp_on = im.mtp != nullptr;
+    const uint64_t tile_available_bytes = im.cfg.layer_tile_tokens == -1 ? pio::mem_available_bytes() : 0;
+    const int layer_tile_tokens =
+        select_layer_tile(im.cfg.layer_tile_tokens, n_prompt - (int) n_common, im.cfg.n_batch, im.cfg.n_ubatch,
+                          llama_model_n_embd(im.model.get()), tile_available_bytes);
+    if (layer_tile_tokens > 0) {
+        const double activation_mib =
+            double(uint64_t(layer_tile_tokens) * llama_model_n_embd(im.model.get()) * sizeof(float)) /
+            (1024.0 * 1024.0);
+        std::fprintf(stderr, "bmoe: prefill layer tile=%d tokens (%s), ubatch=%d, activation=%.1f MiB",
+                     layer_tile_tokens, im.cfg.layer_tile_tokens == -1 ? "auto" : "manual", im.cfg.n_ubatch,
+                     activation_mib);
+        if (im.cfg.layer_tile_tokens == -1)
+            std::fprintf(stderr, ", available host=%.1f MiB", double(tile_available_bytes) / (1024.0 * 1024.0));
+        std::fputc('\n', stderr);
+    }
     // With a prefill device the prompt goes in one ubatch per decode, so each graph's width is one we
     // chose and can place: wide pieces on the device, a narrow tail on the CPU. Left to llama_decode,
     // a batch would be split into ubatches whose last one could be one token wide — the shape of the
@@ -1836,7 +1864,7 @@ RunResult Session::generate(const GenerateRequest & req,
             pf = llama_batch_get_one(tokens.data() + i, chunk);
         }
         trace_begin(i, chunk, /*phase*/ 0);
-        if (im.decode_placed(ctx, pf, im.cfg.layer_tile_tokens > 0) != 0) {
+        if (im.decode_placed(ctx, pf, layer_tile_tokens) != 0) {
             if (im.cancel_requested.load(std::memory_order_relaxed)) {
                 rollback_turn();
                 res.ok = true;

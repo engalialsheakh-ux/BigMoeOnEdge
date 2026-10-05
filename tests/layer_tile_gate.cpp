@@ -1,4 +1,6 @@
 #include "bmoe/runtime.h"
+#include "bmoe/session.h"
+#include "ggml-backend.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -9,7 +11,7 @@
 #include <string>
 #include <vector>
 
-static bool check_case(llama_model * model, int n_tokens) {
+static bool check_case(llama_model * model, int n_tokens, int tile_tokens = 512) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 1024;
     params.n_batch = 1024;
@@ -26,8 +28,8 @@ static bool check_case(llama_model * model, int n_tokens) {
     for (int i = 0; i < n_tokens; ++i)
         tokens[i] = 4 + (i % 220);
     if (llama_decode(reference.get(), llama_batch_get_one(tokens.data(), n_tokens)) != 0 ||
-        llama_decode_layer_tiled(tiled.get(), llama_batch_get_one(tokens.data(), n_tokens), 512) != 0) {
-        std::fprintf(stderr, "tiled decode failed at %d tokens\n", n_tokens);
+        llama_decode_layer_tiled(tiled.get(), llama_batch_get_one(tokens.data(), n_tokens), tile_tokens) != 0) {
+        std::fprintf(stderr, "tiled decode failed at %d tokens with tile %d\n", n_tokens, tile_tokens);
         return false;
     }
 
@@ -98,16 +100,20 @@ static bool check_case(llama_model * model, int n_tokens) {
 int main(int argc, char ** argv) {
     if (argc != 2) return 2;
     llama_backend_init();
+    bool gpu_available = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
+        gpu_available |= ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
     llama_model_params params = llama_model_default_params();
     params.n_gpu_layers = 0;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1], params),
                                                                     llama_model_free);
     if (!model) return 1;
     bool ok = check_case(model.get(), 1) && check_case(model.get(), 64) && check_case(model.get(), 65) &&
-              check_case(model.get(), 130) && check_case(model.get(), 520);
+              check_case(model.get(), 130) && check_case(model.get(), 520) && check_case(model.get(), 520, 1024) &&
+              check_case(model.get(), 900, 1024) && check_case(model.get(), 900, 8192);
     model.reset();
     llama_backend_free();
-    if (ok) {
+    if (ok && gpu_available) {
         bmoe::RunConfig cfg;
         cfg.model_path = argv[1];
         cfg.prompt = std::string(520, 'a');
@@ -121,13 +127,52 @@ int main(int argc, char ** argv) {
         const bmoe::RunResult reference = bmoe::run(cfg);
         cfg.layer_tile_tokens = 512;
         const bmoe::RunResult tiled = bmoe::run(cfg);
-        ok = reference && tiled && reference.generated_text == tiled.generated_text;
+        cfg.layer_tile_tokens = -1;
+        const bmoe::RunResult adaptive = bmoe::run(cfg);
+        ok = reference && tiled && adaptive && reference.generated_text == tiled.generated_text &&
+             reference.generated_text == adaptive.generated_text;
         if (!ok) {
-            std::fprintf(stderr, "streamed generated output differs: reference='%s' tiled='%s'; errors='%s'/'%s'\n",
-                         reference.generated_text.c_str(), tiled.generated_text.c_str(), reference.error.c_str(),
-                         tiled.error.c_str());
+            std::fprintf(
+                stderr,
+                "streamed generated output differs: reference='%s' tiled='%s' adaptive='%s'; errors='%s'/'%s'/'%s'\n",
+                reference.generated_text.c_str(), tiled.generated_text.c_str(), adaptive.generated_text.c_str(),
+                reference.error.c_str(), tiled.error.c_str(), adaptive.error.c_str());
+        }
+        auto two_turns = [&](int tile, bmoe::RunResult & first, bmoe::RunResult & second) {
+            bmoe::SessionConfig sc = bmoe::session_config_from(cfg);
+            sc.layer_tile_tokens = tile;
+            sc.chatml = true;
+            std::string error;
+            std::unique_ptr<bmoe::Session> session = bmoe::Session::open(sc, error);
+            if (!session) {
+                std::fprintf(stderr, "chat session open failed: %s\n", error.c_str());
+                return false;
+            }
+            bmoe::GenerateRequest req;
+            req.prompt = std::string(520, 'a');
+            req.n_predict = 8;
+            req.think = false;
+            first = session->generate(req);
+            if (!first) return false;
+            req.prompt = "What next?";
+            req.clear_kv = false;
+            second = session->generate(req);
+            return second && first.summary.n_prompt > 512 && second.summary.n_prompt > 0;
+        };
+        bmoe::RunResult first_ref, second_ref, first_auto, second_auto;
+        const bool continued = two_turns(512, first_ref, second_ref) && two_turns(-1, first_auto, second_auto);
+        if (!continued || first_ref.generated_text != first_auto.generated_text ||
+            second_ref.generated_text != second_auto.generated_text ||
+            first_ref.summary.n_prompt != first_auto.summary.n_prompt ||
+            second_ref.summary.n_prompt != second_auto.summary.n_prompt ||
+            second_ref.summary.n_past != second_auto.summary.n_past) {
+            std::fprintf(stderr, "chat continuation differs: ref='%s'/'%s', auto='%s'/'%s'; suffix=%d/%d\n",
+                         first_ref.generated_text.c_str(), second_ref.generated_text.c_str(),
+                         first_auto.generated_text.c_str(), second_auto.generated_text.c_str(),
+                         second_ref.summary.n_prompt, second_auto.summary.n_prompt);
+            ok = false;
         }
     }
-    if (ok) std::puts("layer-tiled metadata and generated output match; logits within 1e-6");
+    if (ok) std::puts("layer-tiled metadata and available-backend generated output match; logits within 1e-6");
     return ok ? 0 : 1;
 }

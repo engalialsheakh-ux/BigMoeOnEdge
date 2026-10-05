@@ -376,10 +376,25 @@ int main() {
         c.gpu.n_gpu_layers = -1;
         c.layer_tile_tokens = 512;
         expect_ok("layer-tiled prefill with 64-token CUDA graphs", c);
+        c.layer_tile_tokens = 1024;
+        expect_ok("larger layer tile", c);
+        c.layer_tile_tokens = -1;
+        expect_ok("adaptive layer tile", c);
+        c.layer_tile_tokens = 768;
+        expect_fail("non-power-of-two layer tile is rejected", c);
+        c.layer_tile_tokens = 2048;
+        expect_fail("layer tile larger than context is rejected", c);
+        c.n_ctx = 8192;
+        c.layer_tile_tokens = 8192;
+        expect_ok("largest supported layer tile", c);
+        c.layer_tile_tokens = 16384;
+        expect_fail("unsupported layer tile is rejected", c);
+        c.n_ctx = 1024;
+        c.layer_tile_tokens = 512;
         c.n_ubatch = 128;
         expect_fail("layer-tiled prefill rejects physical width 128", c);
         c.n_ubatch = 64;
-        c.layer_tile_tokens = -1;
+        c.layer_tile_tokens = -2;
         expect_fail("layer-tiled prefill rejects negative tile size", c);
     }
 

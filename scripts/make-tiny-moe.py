@@ -192,6 +192,7 @@ def build_qwen35moe(out):
     w.add_full_attention_interval(4)
     w.add_file_type(gguf.LlamaFileType.ALL_F32)
     add_tokenizer(w, tokens, scores, toktypes)
+    w.add_chat_template("{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}assistant: ")
 
     w.add_tensor("token_embd.weight", rnd(n_vocab, N_EMBD, seed=1))
     w.add_tensor("output_norm.weight", rnd(N_EMBD, seed=2))

@@ -28,16 +28,22 @@ build-cuda/cli/Release/bmoe-cli.exe -m model.gguf -p 'The capital of Japan is' -
 
 The Windows CLI accepts `--cache-type-k f16|q8_0|q4_0` and `--cache-type-v f16|q8_0|q4_0` independently. Both default to `f16` when omitted; they select llama.cpp's existing KV cache storage types without changing model weights. The `bmoe-kv-cache: K=... V=...` startup line reports the types passed to the successfully created context. llama.cpp checks whether the chosen types work with the model and attention mode; in particular, a quantized V cache may require Flash Attention.
 
-For the Qwen3.5 MoE hybrid model, `--prefill-layer-tile 512` enables an experimental
-layer-major prompt schedule: eight 64-token microbatches per logical tile,
-while physical CUDA graphs and quantized FlashAttention remain width 64.
-It requires `--ubatch 64 --moe-stream --n-gpu-layers -1`, a context of at least
+For the Qwen3.5 MoE hybrid model, `--prefill-layer-tile N|auto` enables an
+experimental layer-major prompt schedule. Manual `N` is a power of two from
+512 through 8192 and cannot exceed the context or session batch capacity.
+`auto` grows toward the smallest supported tile covering the prompt, capped at
+8192, session batch capacity, and one eighth of currently available host RAM
+for the F32 activation plane; unknown memory
+falls back to 512. A continued session chooses again for its new prompt suffix.
+The physical CUDA graphs and quantized FlashAttention remain width 64. It
+requires `--ubatch 64 --moe-stream --n-gpu-layers -1`, a context of at least
 512 tokens, and no speculation or prefill device. It is off by default and
-does not change one-token decode. The executor uses one reusable 4 MiB host
-activation plane at hidden width 2,048. If tiled execution fails after state
+does not change one-token decode. At hidden width 2,048 the reusable host
+activation plane is 4 MiB at 512 and 64 MiB at 8192. Runtime diagnostics
+report the selected tile and plane size. If tiled execution fails after state
 mutation, the context is invalidated and the session must be reopened. The
 [wide-prefill report](bench-data/2026-10-04-cuda-wide-prefill/README.md) records
-the short-model result, exact-output gate and long-context comparison.
+the replay sweep, exact-output gates and measured 64K comparison.
 
 For quantized KV on pre-Ada CUDA, eligible D=256 Q4_0/Q8_0 GQA batches of 2–64 queries use a CUDA MMA kernel that stages only the current quantized K/V tile and expands it into the MMA tile. Eligible single-query decode uses the same path automatically at 4096 or more KV positions on Ampere; shorter decode uses a vector FlashAttention kernel that shares K/V reads across query heads. Neither path allocates a context-sized F16 K/V copy. The MMA path requires NVIDIA cp.async support, aligned K/V rows, a padded KV length, a mask without ALiBi, no sparse gather, and enough shared memory. Other shapes retain llama.cpp's existing MMA/tile fallback and may convert K/V to F16 scratch. `--cuda-fa-telemetry` reports the actual paths and scratch allocation at exit.
 

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.33.0] - 2026-10-05
+
+### Added
+- Allow opt-in Qwen3.5 MoE layer tiles of 512, 1024, 2048, 4096 or 8192
+  tokens, plus `--prefill-layer-tile auto`. Auto bounds the host activation
+  plane by prompt length and available memory; omitted flags retain the
+  existing execution path.
+- Extend the exact hybrid state gate to larger tiles and two-turn ChatML
+  continuation. The 64K comparison measured 55.50 versus 40.56 prefill
+  tokens/s with identical generated text. One-token decode code is unchanged.
+
 ## [0.32.0] - 2026-10-04
 
 ### Added

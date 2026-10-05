@@ -461,7 +461,7 @@ struct RunConfig {
     // Decode is unaffected: a decode graph is one token wide whatever this says. The cost is
     // prefill throughput, which processes a long prompt in more, smaller passes.
     int n_ubatch = 0;
-    int layer_tile_tokens = 0; // experimental Qwen3.5 MoE prefill; 0 disables, 512 selects eight 64-token graphs
+    int layer_tile_tokens = 0; // 0 disables, -1 selects a tile per prompt, positive values fix the tile size
     bool chatml = false;       // wrap the prompt in the model family's chat turn (arch-aware)
     bool progress = false;     // emit machine telemetry (one JSON line per token)
 

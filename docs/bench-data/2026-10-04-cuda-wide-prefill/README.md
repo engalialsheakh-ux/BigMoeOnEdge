@@ -275,3 +275,130 @@ decode-path change. Demand stall still accounts for about 19% of tiled prefill
 wall time, while most elapsed time lies outside the measured stall and cache
 management timers. A detailed compute attribution would need a separate
 profile and was not part of this single-run validation.
+
+## Adaptive tile follow-up (2026-10-05)
+
+The exact 3,401-token access trace was replayed at the same 4,400 MiB expert
+cache budget, 64-token physical width and unchanged expert IDs. The repeated
+ID fraction counts expert selections repeated within a logical tile; it is a
+reuse opportunity, not an observed cache-hit rate. This replay predicts I/O,
+not wall time or the 64K route sequence.
+
+| Tile | Microbatches/tile | Tiles/64K | Host F32 plane | Repeated IDs | Replay rereads | Expert read MiB | Physical read MiB | Physical drop vs 512 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 8 | 128 | 4 MiB | 81.79% | 27,877 | 61,922.8 | 62,248.0 | 0% |
+| 1024 | 16 | 64 | 8 MiB | 89.03% | 14,658 | 39,615.8 | 39,825.0 | 36.02% |
+| 2048 | 32 | 32 | 16 MiB | 94.04% | 5,357 | 23,920.3 | 24,047.0 | 61.37% |
+| 4096 | 64 | 16 | 32 MiB | 96.80% | 0 | 14,880.4 | 14,957.6 | 75.97% |
+| 8192 | 128 | 8 | 64 MiB | 96.80% | 0 | 14,880.4 | 14,957.6 | 75.97% |
+
+The 3,401-token trace fits in one 4096 tile, so 8192 adds no benefit on that
+trace. A cyclic extension to 16K tokens, explicitly a simulation rather than
+new model routing, still reduced physical reads from 26,108.7 MiB at 8192
+to 14,957.6 MiB at 16384. The implemented cap stays at 8192: the 64 MiB plane
+is small on this 16 GiB host, while the real 64K gain is already near the
+compute floor. The hybrid transaction continues to prepare each microbatch
+once, records only small KV/recurrent descriptors per microbatch, and fails
+closed after any execution error. Manual 512 remains available and the default
+remains off. Auto grows toward the smallest power-of-two tile covering the
+prompt, capped at 8192 and session batch capacity, subject to one eighth of
+available host memory for the plane; unknown memory selects 512.
+The descriptor count is one per 64-token microbatch, independent of tile size:
+1,024 for the 65,507-token request. No full-prompt activation or recurrent
+tensor snapshot is allocated. The F32 plane is the tile-dependent temporary
+memory term. KV/recurrent descriptors are reused across all 40 layer graphs
+for each microbatch, so increasing tile size does not increase their count.
+
+An AC-powered same-binary 128-token A/B used the same 3,401-token request and
+the frozen CUDA/cache configuration. Auto selected 4096 (32 MiB plane):
+
+| Short run | Tile 512 | Auto 4096 |
+| --- | ---: | ---: |
+| Prefill seconds | 87.078 | 65.412 |
+| Prefill tokens/s | 39.06 | 51.99 |
+| Expert rereads | 27,877 | 0 |
+| Prefill read MiB | 62,248.0 | 14,957.6 |
+| Decode tokens/s | 7.470 | 7.618 |
+
+Both runs produced exactly the same 128-token text. The 24.88% prefill-time
+improvement clears the implementation gate. The 1.98% decode-rate difference
+is within short-run variation and is not a decode optimization claim.
+
+One final 64K run used the exact prior 65,507-token prompt and 64-token
+request. The prompt, generation length and output text were identical to the
+512-tile run. The invocation used the arguments in
+[final-config.txt](../2026-10-04-baseline-freeze/final-config.txt), the
+tracked [prompt recipe](../2026-10-04-baseline-freeze/prompt-recipe.ps1),
+`GGML_CUDA_FATTN_MMA_QUANT=auto`, and `--prefill-layer-tile auto` in place of
+the previous `512`; the CLI was run in session mode from PowerShell with
+`n_predict=64`, `think=false`, `clear_kv=true`. Auto selected 8192, eight
+tiles, and a 64 MiB host activation plane.
+
+The command below reproduces the final run from the repository root after
+setting `$model` to the existing GGUF path. The tracked prompt recipe emits
+the verified 300,104-byte prompt, SHA-256
+`4fb37b40ed6e03e794b9249afe78d628f4d1b3dcfcdf2be2604f66f4fc51702f`.
+
+```powershell
+$model = 'MODEL.gguf'
+$promptFile = 'build-cuda/adaptive-prompt.txt'
+powershell -NoProfile -ExecutionPolicy Bypass -File docs/bench-data/2026-10-04-baseline-freeze/prompt-recipe.ps1 -OutputPath $promptFile
+$prompt = [IO.File]::ReadAllText((Resolve-Path $promptFile))
+$request = @{ cmd='generate'; id=1; prompt=$prompt; n_predict=64; think=$false; clear_kv=$true } | ConvertTo-Json -Compress
+$env:GGML_CUDA_FATTN_MMA_QUANT = 'auto'
+$request | & build-cuda/cli/Release/bmoe-cli.exe --session --model $model --n-predict 64 `
+    --moe-stream --ctx-size 262144 --ubatch 64 --threads 6 `
+    --cache-mb 4400 --cache-ceil-mb 4400 --io-threads 4 --overlap --io-coalesce `
+    --dense-weights anon --release-mmap --require-release-mmap --n-gpu-layers -1 `
+    --gpu-expert-cache-mb 1500 --gpu-expert-window 4 --gpu-safety-mb 128 `
+    --cpu-affinity-mask 0xFFF --flash-attn auto --cache-type-k q4_0 --cache-type-v q4_0 `
+    --cuda-fa-telemetry --progress --prefill-layer-tile auto
+```
+
+| 64K quantity | Tile 512 | Auto 8192 | Change |
+| --- | ---: | ---: | ---: |
+| Prefill seconds | 1,615.059 | 1,180.404 | -26.91% |
+| Prefill tokens/s | 40.56 | 55.50 | +36.83% |
+| Expert rereads | 664,841 | 44,620 | -93.29% |
+| Prefill expert read MiB | 1,144,418.2 | 92,456.7 | -91.92% |
+| Demand stall seconds | 305.515 | 26.072 | -91.47% |
+| Cache management seconds | 125.907 | 12.570 | -90.02% |
+| Decode tokens/s | 9.032 | 8.456 | -6.38% |
+
+The final run committed eight tiles and 1,024 microbatches with 40,960 layer
+graphs. It made 5,572,245 expert-cache lookups and 5,517,749 hits (99.0%).
+The coalescer reported 97,437.3 MiB physical reads across 140,769 windows
+for prefill plus decode. Sampled process private memory was 10.89 GiB; the
+fixed CUDA allocations included 1,440 MiB Q4_0 KV, 70.32 MiB compute and a
+1,500 MiB GPU expert pool. The allocation precheck reported 6,143.5 MiB total
+and 1,656.0 MiB free dedicated VRAM before the pool, leaving 156 MiB after
+its request. These are allocation figures and process snapshots, not peak
+VRAM telemetry.
+
+The long-run decode rate is 6.38% below the earlier single 512 run, but the
+one-token decode code and 64-token generated text are identical, as are 8,498
+GPU expert hits, 11,982 CPU misses and 1,245 promotions. The controlled short
+A/B showed no decode slowdown. The long-run difference is reported as measured;
+its cause was not isolated. For this 64-token round, prefill plus decode fell
+from about 1,622.1 to 1,188.0 seconds (26.8%), so the overall latency gain outweighs
+the observed decode difference. The remaining prefill demand stall and cache
+management total only 38.642 seconds (3.27% of prefill wall); graph execution,
+compute and synchronization form the unseparated dominant remainder. Decode
+reported 72.2 ms/token compute, 36.4 ms/token demand stall and 9.7 ms/token
+cache management. The asynchronous GPU upload worker transferred 2,100.94 MiB
+in 543.718 ms cumulative time; GPU synchronization and graph/setup time were
+not isolated by these counters. The earlier eight-token
+[Nsight diagnostic](../2026-10-03-exact-endgame/README.md) saw short CUDA graph
+intervals of roughly 0.24-0.56 ms/token, but could not assign a steady 64K
+synchronization or graph setup cost.
+Existing GPU residency is per-layer. Prior held-out allocation and
+route-predictor replays did not show a meaningful decode miss reduction, so no
+speculative decode-cache rewrite was retained.
+
+CUDA Release built and focused MoE, hybrid, configuration and tile gates
+passed 12/12. CPU Release built; its configuration and direct tile gates
+passed 3/3 and the qwen3moe MoE gate passed. The tile gate checked 1024 and
+8192 arguments, KV/recurrent metadata, post-tile decode and two-turn ChatML
+continuation with matching output and state position. Both parent and
+fork `git diff --check` and clang-format 18 on changed project C++ files
+passed.

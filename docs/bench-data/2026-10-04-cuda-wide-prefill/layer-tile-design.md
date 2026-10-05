@@ -1,7 +1,9 @@
 # Layer-tiled prefill transaction
 
-The opt-in Windows CLI path `--prefill-layer-tile 512` schedules eight physical
-64-token graphs per logical tile, one model layer at a time. The normal
+The opt-in Windows CLI path `--prefill-layer-tile N|auto` schedules 8 to 128
+physical 64-token graphs per logical tile, one model layer at a time. Manual
+tiles are powers of two from 512 through 8192; auto selects a bounded tile
+from the prompt length and available host memory. The normal
 `llama_decode` path retains its full-layer graph. The path is restricted to
 Qwen3.5 MoE with causal inference, full CUDA placement, streamed experts, and
 64-token ubatches. A final partial tile and partial microbatch are supported.
@@ -35,9 +37,10 @@ caller must discard the session. There is no tensor rollback or copy-on-write.
 
 ## Activation and graph memory
 
-One reusable host F32 plane holds the hidden state for one 512-token tile.
-For the measured model, `512 * 2048 * 4 = 4,194,304` bytes (4 MiB). A layer
-reads each microbatch's slice before overwriting it with that layer's output.
+One reusable host F32 plane holds the hidden state for one logical tile.
+For the measured model, `tile_tokens * 2048 * 4` is 4 MiB at 512 and 64 MiB
+at 8192. A layer reads each microbatch's slice before overwriting it with
+that layer's output.
 No full-prompt or per-layer plane is allocated. The physical graph width stays
 64, preserving the measured 70.3 MiB CUDA compute buffer, 1,440 MiB Q4 K/V
 allocation and direct quantized FlashAttention dispatch. The 1,500 MiB GPU
@@ -51,14 +54,18 @@ the width-64 trace's 269,097.7 MiB. This was an I/O replay, not a speed
 measurement; see the parent [README](README.md).
 
 **MEASURED:** The tiny Qwen3.5 MoE hybrid gate compares ordinary and tiled
-execution for 1, 64, 65, 130 and 520 prompt tokens, including exact serialized
-KV-cell metadata, recurrent-cell metadata, sequence position, and post-tile
-decode. CPU floating logits differ by at most about `2.75e-8` when the graph
+execution for 1, 64, 65, 130, 520 and 900 prompt tokens, including 1024 and
+8192 tile arguments, and exact serialized KV-cell metadata, recurrent-cell
+metadata, sequence position, and post-tile
+decode. The same fixture now supplies a ChatML template; two continued
+generation turns match between manual 512 and auto, including token positions.
+CPU floating logits differ by at most about `2.75e-8` when the graph
 is split; the gate uses a documented `1e-6` floating tolerance. Generated
 output from the streamed tiny CUDA session matches exactly. The one short
 real-model 3,401-token run also generated text exactly matching the frozen
 width-64 reference; its detailed measurements are in the parent README.
 
-**THEORETICAL:** The bounded host plane remains 4 MiB even for a 64K prompt:
-the same plane is reused for each tile. This says nothing by itself about
-64K throughput or total process memory.
+**MEASURED:** Auto selected 8192 for the 65,507-token prompt and used one
+64 MiB host plane for eight tiles. It prepared 1,024 microbatches once each,
+unchanged from the 512-tile run. The parent README records the throughput,
+memory snapshot and expert-read counters.
