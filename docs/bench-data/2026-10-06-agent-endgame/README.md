@@ -73,4 +73,63 @@ tiling on this recorded trace. The simple capacity rule is much worse because
 the aggregate routed set over all 40 layers exceeds RAM even for one small
 microbatch, although each layer's bank fits. Planning overhead and extra
 router graphs therefore cannot pay on this evidence. The replay tool remains
-for future traces; the runtime default stays adaptive auto.
+for future traces; the measured agent configuration keeps `--prefill-layer-tile auto`.
+
+## Integrated coding-agent request
+
+The final request was a code-review task over 65,000 characters of this
+repository's `session.cpp` plus a short instruction, saved locally as
+`build-cuda/final-agent-prompt.txt` (65,484 UTF-8 bytes, SHA-256
+`8dbb71d6aa0cbb86a10de503d98d732d54d6f38ebba0a89b24fdc5a5e259bd7d`).
+The source text was taken before the later GPU exactness guard, from parent
+commit `4b6e755`; the prompt is deliberately kept in the ignored build tree.
+Regenerate it with
+`py docs/bench-data/2026-10-06-agent-endgame/prompt-recipe.py build-cuda/final-agent-prompt.txt`.
+The model was the existing Qwen3.6-35B-A3B Q4_K_M GGUF. The run used a
+262,144-token context, Q4_0 K/V on CUDA, 4,400 MiB RAM expert cache,
+1,500 MiB GPU expert pool, 128 MiB safety rail, adaptive layer tiles,
+greedy decoding, and `--gpu-expert-no-promote`. The pool stays allocated but
+empty to keep the output deterministic. No model or asset was downloaded.
+
+Two identical fresh `--session` requests, each capped at 1,292 generated
+tokens, ran in one process. The second automatically restored the persisted
+hybrid prefix. A third request after process restart checked disk reuse with
+a 16-token continuation. All three started with the same 16 output tokens;
+the two full 1,292-token outputs were byte-identical (display-text SHA-256
+`f788ad728d9dfe5fc291df708b8b1a4eb60d4506cc936d77029f5e21d32423cf`).
+
+| Quantity | Cold | In-process cached | Restart cached |
+| --- | ---: | ---: | ---: |
+| Prompt tokens actually prefilled | 17,663 | 255 | 255 |
+| Prefix tokens restored | 0 | 17,408 | 17,408 |
+| Prefill seconds | 337.929 | 10.622 | 11.206 |
+| State restore seconds | — | 0.038 | 0.593 |
+| First generated-token wall seconds | 0.380 | 0.339 | 0.541 |
+| Request first response seconds, excluding model load | 338.309 | 10.999 | 12.340 |
+| Model load seconds | 9.301 | already loaded | 8.780 |
+| First response seconds, including a fresh model load | 347.610 | — | 21.120 |
+| Generated tokens | 1,292 | 1,292 | 16 |
+| Decode tokens/s | 8.126 | 7.802 | 6.873 |
+
+The checkpoint saved 17,408 of 17,663 prompt tokens (98.56%). It occupied
+158.8 MiB of sequence state (166,622,224 bytes including the file header and
+tokens), and capture took 0.472 s. Sampled process private memory during the
+large run was about 10.9 GiB, not a measured peak. The configured RAM expert
+cache reported 4,399 MiB resident; CUDA Q4_0 KV reserved 1,440 MiB, and the
+GPU expert pool reserved 1,500 MiB with zero promoted experts. The decode-rate
+difference between the two exact runs is not claimed as a speed change; the
+accepted gain is first-response latency from avoided prefill. This result
+does not show faster one-token model math.
+
+An initial run with dynamic GPU expert promotions did not meet the output
+identity gate: the cold and cached 1,292-token texts differed after 50 tokens,
+and two cached 128-token continuations also differed. Two cached 128-token
+runs with promotions disabled matched, as did a separate cold/cached
+128-token real-model pair. This motivated the explicit configuration guard;
+the initial run is excluded from the exactness result above.
+
+The accepted code changes do not alter general cold-prefill execution when
+`--agent-state-cache` is omitted, and the replay planner is offline only.
+Therefore the 64K benchmark was not rerun. The frozen 55.50 prefill tokens/s
+and 44,620 expert rereads remain the long-context reference; no new 64K claim
+is made.

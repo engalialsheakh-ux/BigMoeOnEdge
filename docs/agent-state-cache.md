@@ -54,6 +54,10 @@ after restart. The second run also had a warmer expert cache, so the difference
 is not attributable to state reuse alone. These are short-run observations, not
 the final agent-workload benchmark.
 
+The [agent-latency endgame report](bench-data/2026-10-06-agent-endgame/README.md)
+contains the final 17,663-token, 1,292-output-token cold/cached comparison in
+the deterministic GPU placement mode.
+
 Example:
 
 ```powershell

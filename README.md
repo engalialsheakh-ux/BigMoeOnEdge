@@ -184,6 +184,12 @@ breaks each token into flash I/O, cache management and compute, next to the cach
 bytes read, and `--csv` adds the memory picture those numbers must be read against. The Android
 app renders the same feed live while you chat. More under [Telemetry](#telemetry).
 
+For repeated coding-agent prompts on the Windows CLI, `--agent-state-cache FILE` saves one
+hybrid prefix checkpoint and restores it across requests or process restarts when the
+tokenized prefix and model configuration match. With a GPU expert pool, add
+`--gpu-expert-no-promote` to keep greedy continuation deterministic. See
+[Persistent agent prefix state](docs/agent-state-cache.md) for the cache rules and measured cost.
+
 ### Decisions: choose instead of generate
 
 Many uses of a model are really a choice: which UI action an agent takes next, which tool a router

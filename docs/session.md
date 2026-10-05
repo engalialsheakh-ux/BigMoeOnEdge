@@ -41,6 +41,14 @@ for its own tokens, not a full re-prefill — which matters because prefill is t
 device. `BMOE_DONE.n_prompt` reports the tokens actually prefilled this turn; `n_past` is the total
 context length after it.
 
+**Persistent fresh-request prefix reuse.** `SessionConfig::agent_state_cache_path` optionally
+keeps one exact hybrid sequence checkpoint in memory and on disk. A fresh request whose tokenized
+prompt starts with the saved tokens restores attention KV and recurrent state, then prefills only
+its suffix. The model/config identity and a checksum reject stale or corrupt files; a miss runs
+the normal cold path. This complements live chat continuation. The persistent checkpoint is
+consulted only for `clear_kv=true`. With a GPU expert pool, dynamic expert promotion must be
+disabled for deterministic greedy continuation. See [agent-state-cache.md](agent-state-cache.md).
+
 **Fallbacks and costs.** SWA-style memory (e.g. Gemma) can refuse a partial `seq_rm`; the engine
 then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). With
 thinking **on**, the template strips the previous turn's reasoning on re-render, so the rendered
