@@ -11,6 +11,9 @@ Semantic Versioning.
   Matching requests restore attention KV and recurrent state, skip the saved
   prompt tokens, and reject changed or corrupt snapshots. The feature is opt-in
   with `--agent-state-cache FILE`; see `docs/agent-state-cache.md`.
+- Add an offline exact-routing-set partition replay. On the recorded short
+  hybrid trace, its cost-optimal boundaries match adaptive auto, so the
+  runtime policy remains unchanged.
 
 ## [0.33.0] - 2026-10-05
 
