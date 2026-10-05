@@ -54,6 +54,15 @@ int main() {
     // Baseline and the pre-existing scalar rules.
     expect_ok("valid minimal config", ok_base());
     {
+        RunConfig c = ok_moe();
+        c.gpu.n_gpu_layers = -1;
+        c.gpu.expert_cache_mb = 1500;
+        c.agent_state_cache_path = "checkpoint.bin";
+        expect_fail("agent state cache with dynamic GPU promotions changes deterministic output", c);
+        c.gpu.expert_cache_promote = false;
+        expect_ok("agent state cache with fixed empty GPU pool", c);
+    }
+    {
         using KvCacheType = RunConfig::GpuConfig::KvCacheType;
         RunConfig c = ok_base();
         if (c.gpu.cache_type_k != KvCacheType::F16 || c.gpu.cache_type_v != KvCacheType::F16) {

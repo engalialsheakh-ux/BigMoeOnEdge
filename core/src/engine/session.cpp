@@ -305,10 +305,10 @@ uint64_t agent_state_key(const SessionConfig & cfg) {
              << cfg.n_batch << '|' << cfg.n_ubatch << '|' << cfg.layer_tile_tokens << '|' << cfg.n_threads << '|'
              << cfg.n_expert_used << '|' << cfg.gpu.n_gpu_layers << '|' << cfg.gpu.main_gpu << '|' << cfg.gpu.kv_offload
              << '|' << int(cfg.gpu.flash_attn) << '|' << int(cfg.gpu.cache_type_k) << '|' << int(cfg.gpu.cache_type_v)
-             << '|' << cfg.moe.enabled << '|' << cfg.moe.cache_mb << '|' << cfg.moe.overlap << '|'
-             << cfg.moe.drop_cold_frac << '|' << cfg.moe.substitute_lambda << '|' << cfg.moe.route_ahead << '|'
-             << cfg.prefill.device << '|' << cfg.prefill.min_tokens << '|' << cfg.prefill.routed << '|'
-             << cfg.prefill.routed_full_frac << '|';
+             << '|' << cfg.gpu.expert_cache_mb << '|' << cfg.gpu.expert_cache_promote << '|' << cfg.moe.enabled << '|'
+             << cfg.moe.cache_mb << '|' << cfg.moe.overlap << '|' << cfg.moe.drop_cold_frac << '|'
+             << cfg.moe.substitute_lambda << '|' << cfg.moe.route_ahead << '|' << cfg.prefill.device << '|'
+             << cfg.prefill.min_tokens << '|' << cfg.prefill.routed << '|' << cfg.prefill.routed_full_frac << '|';
     const std::string serialized = settings.str();
     return hash_bytes(h, serialized.data(), serialized.size());
 }
@@ -1033,6 +1033,9 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         (cfg.spec.enabled() || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
          cfg.moe.substitute_lambda > 0.0f || cfg.moe.route_ahead > 0))
         return fail("agent state cache requires greedy sampling and exact, unspeculated routing");
+    if (!cfg.agent_state_cache_path.empty() && cfg.gpu.expert_cache_mb > 0 && cfg.gpu.expert_cache_promote)
+        return fail("agent state cache with a GPU expert pool requires --gpu-expert-no-promote "
+                    "for deterministic continuation");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.

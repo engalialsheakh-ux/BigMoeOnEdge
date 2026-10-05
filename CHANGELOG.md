@@ -11,6 +11,9 @@ Semantic Versioning.
   Matching requests restore attention KV and recurrent state, skip the saved
   prompt tokens, and reject changed or corrupt snapshots. The feature is opt-in
   with `--agent-state-cache FILE`; see `docs/agent-state-cache.md`.
+- Require fixed GPU expert placement for the persistent cache: dynamic
+  promotions can make repeated greedy output diverge through CPU/GPU numeric
+  differences, so a configured GPU expert pool needs `--gpu-expert-no-promote`.
 - Add an offline exact-routing-set partition replay. On the recorded short
   hybrid trace, its cost-optimal boundaries match adaptive auto, so the
   runtime policy remains unchanged.

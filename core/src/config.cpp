@@ -96,6 +96,10 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1)) {
         return fail("gpu.expert_cache_mb requires --moe-stream and --n-gpu-layers -1");
     }
+    if (!cfg.agent_state_cache_path.empty() && cfg.gpu.expert_cache_mb > 0 && cfg.gpu.expert_cache_promote) {
+        return fail("--agent-state-cache with a GPU expert pool requires --gpu-expert-no-promote "
+                    "for deterministic continuation");
+    }
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled()) {
         return fail("GPU layer offload does not combine with prefill.device");
     }

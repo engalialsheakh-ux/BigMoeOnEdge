@@ -515,6 +515,7 @@ static void print_usage(const char * argv0) {
         "      --session           keep the model loaded and serve JSON prompt requests from stdin\n"
         "      --agent-state-cache FILE  save one exact hybrid prefix checkpoint and reuse it\n"
         "                          across requests and process restarts when tokens/config match\n"
+        "                          with a GPU expert pool, requires --gpu-expert-no-promote\n"
         "      --decide            with --session: accept decide requests (pick one of a list of\n"
         "                          choices from a single prefill, no decode). Off by default\n"
         "      --decide-prefix-cache M\n"

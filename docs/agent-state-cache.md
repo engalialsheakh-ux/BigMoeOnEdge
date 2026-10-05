@@ -23,6 +23,17 @@ the engine performs a cold prefill and replaces the checkpoint. Greedy sampling
 and exact, unspeculated routing are required. A snapshot larger than 1 GiB is
 not kept, to protect RAM on a 16 GB machine.
 
+When a GPU expert pool is enabled, use `--gpu-expert-no-promote` with this
+checkpoint feature. Dynamic CPU/GPU expert placement can change rounding and
+make two greedy continuations of the same state diverge: a long local run
+matched for 50 tokens before the outputs differed, and two identical restored
+runs also differed. With promotions disabled, a real-model cold/restore pair
+and two repeated restores matched over 128 generated tokens. The pool's
+configured size remains unchanged; it stays empty for this exactness mode.
+The CLI rejects a cache plus active GPU promotions rather than silently
+claiming a deterministic continuation. This exactness requirement can reduce
+decode throughput relative to dynamic promotions.
+
 The checkpoint captures both attention KV and recurrent/SSM state through
 llama.cpp's public sequence-state API. A focused gate mutates the state, restores
 it twice, checks recurrent-state bytes, and compares subsequent logits. The
@@ -36,6 +47,8 @@ For the local hybrid Q4_0 K/V CUDA configuration, a short 1,351-token prompt
 produced a 68.5 MiB checkpoint after 1,024 tokens. Capture took 0.184 s; restore
 took 0.013 s in-process and 0.173 s from disk after restart. The same 327-token
 suffix and 16-token deterministic continuation matched in all three runs.
+This initial diagnostic used dynamic GPU promotions, so it is not the final
+exactness mode.
 Prefill took 28.134 s cold, 6.669 s with an in-process checkpoint, and 7.516 s
 after restart. The second run also had a warmer expert cache, so the difference
 is not attributable to state reuse alone. These are short-run observations, not
@@ -48,6 +61,7 @@ $model = 'MODEL.gguf'
 $checkpoint = 'D:\cache\agent-prefix.bin'
 & build-cuda/cli/Release/bmoe-cli.exe --session --model $model `
     --ctx-size 262144 --ubatch 64 --moe-stream --n-gpu-layers -1 `
+    --gpu-expert-cache-mb 1500 --gpu-expert-no-promote `
     --cache-type-k q4_0 --cache-type-v q4_0 `
     --agent-state-cache $checkpoint
 ```
