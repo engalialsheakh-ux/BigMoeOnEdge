@@ -98,6 +98,18 @@ int main() {
             llama_backend_free();
             return 1;
         }
+        pool.clear_residency();
+        if (pool.resident_count() != 0 || pool.pin(0, 1) || pool.publish(second)) {
+            std::fputs("logical residency survived a fresh request\n", stderr);
+            llama_backend_free();
+            return 1;
+        }
+        const auto after_clear = pool.reserve(0, 0);
+        if (!after_clear || after_clear.slot != first.slot || after_clear.generation == first.generation) {
+            std::fputs("cleared pool did not reuse its allocation safely\n", stderr);
+            llama_backend_free();
+            return 1;
+        }
         pool.reset();
         if (!pool.init(gpu, 1, 3, layers, error)) {
             std::fprintf(stderr, "GPU expert pool reopen failed: %s\n", error.c_str());

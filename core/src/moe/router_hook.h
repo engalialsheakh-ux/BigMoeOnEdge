@@ -135,6 +135,8 @@ public:
     } // non-null → stream mode
 
     void set_gpu_expert_pool(GpuExpertPool * pool);
+    // A fresh independent replay must rediscover the first graph's cache branch.
+    void reset_gpu_graph_discovery();
     void begin_gpu_decode();
     void finish_gpu_decode();
     const std::vector<std::pair<int, int>> & gpu_misses() const { return gpu_misses_; }

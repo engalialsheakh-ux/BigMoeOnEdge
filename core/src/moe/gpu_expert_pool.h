@@ -50,6 +50,8 @@ public:
               std::string & error,
               int safety_mb = 768);
     void reset();
+    // Call only after uploads and graph pins have drained; keeps the device allocation.
+    void clear_residency();
 
     // An upload owns a RESERVED lease until publish() or abandon(). A graph owns a
     // READY lease from pin() through unpin(); eviction skips both kinds of lease.

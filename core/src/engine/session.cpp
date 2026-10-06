@@ -301,11 +301,14 @@ uint64_t agent_state_key(const SessionConfig & cfg) {
     }
 
     std::ostringstream settings;
+    // Promotion is decode-only, so switching it on cannot alter a saved prefill state. Keep the
+    // old zero field in the key so checkpoints made with the fixed empty pool remain reusable.
+    constexpr bool promotion_during_prefill = false;
     settings << "agent-state-v1|" << version() << '|' << LLAMA_STATE_SEQ_VERSION << '|' << cfg.n_ctx << '|'
              << cfg.n_batch << '|' << cfg.n_ubatch << '|' << cfg.layer_tile_tokens << '|' << cfg.n_threads << '|'
              << cfg.n_expert_used << '|' << cfg.gpu.n_gpu_layers << '|' << cfg.gpu.main_gpu << '|' << cfg.gpu.kv_offload
              << '|' << int(cfg.gpu.flash_attn) << '|' << int(cfg.gpu.cache_type_k) << '|' << int(cfg.gpu.cache_type_v)
-             << '|' << cfg.gpu.expert_cache_mb << '|' << cfg.gpu.expert_cache_promote << '|' << cfg.moe.enabled << '|'
+             << '|' << cfg.gpu.expert_cache_mb << '|' << promotion_during_prefill << '|' << cfg.moe.enabled << '|'
              << cfg.moe.cache_mb << '|' << cfg.moe.overlap << '|' << cfg.moe.drop_cold_frac << '|'
              << cfg.moe.substitute_lambda << '|' << cfg.moe.route_ahead << '|' << cfg.prefill.device << '|'
              << cfg.prefill.min_tokens << '|' << cfg.prefill.routed << '|' << cfg.prefill.routed_full_frac << '|';
@@ -443,6 +446,8 @@ struct Session::Impl {
     uint64_t gpu_upload_bytes = 0;
     uint64_t gpu_upload_calls = 0;
     double gpu_upload_ms = 0.0;
+    double gpu_barrier_wait_ms = 0.0;
+    uint64_t gpu_barrier_waits = 0;
     std::vector<uint32_t> gpu_recent_miss;
     uint32_t gpu_decode_sequence = 0;
     struct GpuPromotionJob {
@@ -456,6 +461,7 @@ struct Session::Impl {
     std::mutex gpu_job_mtx;
     std::condition_variable gpu_job_cv;
     std::deque<GpuPromotionJob> gpu_jobs;
+    size_t gpu_jobs_inflight = 0;
     std::vector<GpuCacheTraceEvent> gpu_trace_events;
     std::vector<uint8_t> gpu_queued;
     std::thread gpu_worker;
@@ -481,6 +487,7 @@ struct Session::Impl {
                 job = std::move(gpu_jobs.front());
                 gpu_jobs.pop_front();
                 gpu_pending_bytes -= job.total_bytes;
+                ++gpu_jobs_inflight;
             }
             const uint64_t evictions_before = gpu_experts.evictions();
             auto lease = gpu_experts.reserve(job.layer, job.expert);
@@ -513,8 +520,21 @@ struct Session::Impl {
                     gpu_trace_events.push_back(
                         {job.turn, job.step, job.layer, job.expert, 'P', job.total_bytes, uint8_t(evicted)});
                 gpu_queued[size_t(job.layer) * size_t(gpu_experts.expert_count()) + size_t(job.expert)] = 0;
+                --gpu_jobs_inflight;
             }
+            gpu_job_cv.notify_all();
         }
+    }
+    bool drain_gpu_worker() {
+        if (!gpu_worker.joinable()) return true;
+        std::unique_lock<std::mutex> lock(gpu_job_mtx);
+        if (!gpu_jobs.empty() || gpu_jobs_inflight != 0) {
+            const auto started = clock_t_::now();
+            gpu_job_cv.wait(lock, [&] { return gpu_jobs.empty() && gpu_jobs_inflight == 0; });
+            gpu_barrier_wait_ms += secs(started, clock_t_::now()) * 1000.0;
+            ++gpu_barrier_waits;
+        }
+        return !gpu_worker_failed.load(std::memory_order_acquire);
     }
     void stop_gpu_worker() {
         if (!gpu_worker.joinable()) return;
@@ -547,7 +567,10 @@ struct Session::Impl {
             gpu_recent_miss[recent_index] = gpu_decode_sequence;
             // Repeated routing within a short window is evidence of reuse. The
             // one-hit admission policy churned over 20 slots per token at 2 GiB.
-            if (prior == 0 || gpu_decode_sequence - prior > uint32_t(cfg.gpu.expert_cache_window)) continue;
+            // A duplicate callback or repeated ID within one decode is not a cross-token reuse.
+            if (prior == 0 || prior == gpu_decode_sequence ||
+                gpu_decode_sequence - prior > uint32_t(cfg.gpu.expert_cache_window))
+                continue;
             const void * bytes[MoeRecipe::max_exps]{};
             size_t sizes[MoeRecipe::max_exps]{};
             if (!source.resident_bundle(layer, expert, bytes, sizes)) continue;
@@ -582,6 +605,7 @@ struct Session::Impl {
         return !gpu_worker_failed.load(std::memory_order_acquire);
     }
     int decode_target(llama_context * c, const llama_batch & b) {
+        if (!cfg.agent_state_cache_path.empty() && !drain_gpu_worker()) return -1;
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
         const int result = llama_decode(c, b);
@@ -591,6 +615,7 @@ struct Session::Impl {
                    : result;
     }
     int decode_placed(llama_context * c, const llama_batch & b, int layer_tile_tokens = 0) {
+        if (!cfg.agent_state_cache_path.empty() && !drain_gpu_worker()) return -1;
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
         const int result = layer_tile_tokens > 0 && b.n_tokens > cfg.n_ubatch
@@ -717,11 +742,12 @@ struct Session::Impl {
             std::fprintf(stderr,
                          "bmoe-gpu-cache: gpu_expert_hits=%llu cpu_expert_misses=%llu gpu_promotions=%llu "
                          "gpu_evictions=%llu gpu_cache_resident=%zu gpu_upload_mib=%.2f gpu_upload_ms=%.3f "
-                         "gpu_upload_calls=%llu\n",
+                         "gpu_upload_calls=%llu gpu_barrier_wait_ms=%.3f gpu_barrier_waits=%llu\n",
                          (unsigned long long) hook->gpu_hits(), (unsigned long long) hook->gpu_cpu_misses(),
                          (unsigned long long) gpu_promotions, (unsigned long long) gpu_experts.evictions(),
                          gpu_experts.resident_count(), double(gpu_upload_bytes) / (1024.0 * 1024.0), gpu_upload_ms,
-                         (unsigned long long) gpu_upload_calls);
+                         (unsigned long long) gpu_upload_calls, gpu_barrier_wait_ms,
+                         (unsigned long long) gpu_barrier_waits);
         // Deterministic teardown order: stop the I/O pool (it holds fds into the mmap and its
         // buffers back the rebound expert tensors), then the context (its eval callback points
         // at the hook), then the hook, then unmap the model, then release the backend.
@@ -1033,9 +1059,6 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         (cfg.spec.enabled() || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
          cfg.moe.substitute_lambda > 0.0f || cfg.moe.route_ahead > 0))
         return fail("agent state cache requires greedy sampling and exact, unspeculated routing");
-    if (!cfg.agent_state_cache_path.empty() && cfg.gpu.expert_cache_mb > 0 && cfg.gpu.expert_cache_promote)
-        return fail("agent state cache with a GPU expert pool requires --gpu-expert-no-promote "
-                    "for deterministic continuation");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
@@ -1803,6 +1826,14 @@ RunResult Session::generate(const GenerateRequest & req,
     // clear_kv = "new chat": drop the KV and the engine-held conversation. Otherwise this turn
     // continues the conversation, reusing the KV prefix already decoded from earlier turns.
     if (req.clear_kv) {
+        if (im.agent_cache.key && im.gpu_experts.buffer()) {
+            if (!im.drain_gpu_worker()) return fail("GPU expert promotion failed before state restore");
+            // Each independent agent request starts with the same empty logical VRAM residency.
+            im.gpu_experts.clear_residency();
+            im.hook->reset_gpu_graph_discovery();
+            std::fill(im.gpu_recent_miss.begin(), im.gpu_recent_miss.end(), 0);
+            im.gpu_decode_sequence = 0;
+        }
         im.clear_memory(ctx);
         // The draft context tracks the target's positions and must be dropped with it, or the first
         // draft of the new conversation is conditioned on the previous one.

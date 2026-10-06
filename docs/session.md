@@ -47,7 +47,8 @@ prompt starts with the saved tokens restores attention KV and recurrent state, t
 its suffix. The model/config identity and a checksum reject stale or corrupt files; a miss runs
 the normal cold path. This complements live chat continuation. The persistent checkpoint is
 consulted only for `clear_kv=true`. With a GPU expert pool, dynamic expert promotion must be
-disabled for deterministic greedy continuation. See [agent-state-cache.md](agent-state-cache.md).
+committed between decode tokens; each independent request starts with empty logical GPU residency
+and fresh graph discovery. See [agent-state-cache.md](agent-state-cache.md).
 
 **Fallbacks and costs.** SWA-style memory (e.g. Gemma) can refuse a partial `seq_rm`; the engine
 then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). With

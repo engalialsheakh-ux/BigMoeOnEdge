@@ -30,6 +30,10 @@ void RouterHook::set_gpu_expert_pool(GpuExpertPool * pool) {
     gpu_mapped_layers_.assign(pool->layers().size(), 0);
 }
 
+void RouterHook::reset_gpu_graph_discovery() {
+    std::fill(gpu_graph_layers_.begin(), gpu_graph_layers_.end(), 0);
+}
+
 void RouterHook::begin_gpu_decode() {
     if (!gpu_pool_) return;
     if (!gpu_pins_.empty()) {

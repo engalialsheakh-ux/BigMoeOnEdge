@@ -186,8 +186,8 @@ app renders the same feed live while you chat. More under [Telemetry](#telemetry
 
 For repeated coding-agent prompts on the Windows CLI, `--agent-state-cache FILE` saves one
 hybrid prefix checkpoint and restores it across requests or process restarts when the
-tokenized prefix and model configuration match. With a GPU expert pool, add
-`--gpu-expert-no-promote` to keep greedy continuation deterministic. See
+tokenized prefix and model configuration match. `--gpu-expert-cache-mb N`
+allows deterministic expert promotion with the persistent checkpoint. See
 [Persistent agent prefix state](docs/agent-state-cache.md) for the cache rules and measured cost.
 
 ### Decisions: choose instead of generate

@@ -58,7 +58,7 @@ int main() {
         c.gpu.n_gpu_layers = -1;
         c.gpu.expert_cache_mb = 1500;
         c.agent_state_cache_path = "checkpoint.bin";
-        expect_fail("agent state cache with dynamic GPU promotions changes deterministic output", c);
+        expect_ok("agent state cache with deterministic GPU promotions", c);
         c.gpu.expert_cache_promote = false;
         expect_ok("agent state cache with fixed empty GPU pool", c);
     }

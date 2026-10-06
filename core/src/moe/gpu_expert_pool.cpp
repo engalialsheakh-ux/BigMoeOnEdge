@@ -215,6 +215,20 @@ ggml_tensor GpuExpertPool::projection_tensor(int layer, int slot, int projection
     return tensor;
 }
 
+void GpuExpertPool::clear_residency() {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto & layer : slots_)
+        for (size_t i = 1; i < layer.size(); ++i) {
+            Slot & slot = layer[i];
+            slot.state = State::Empty;
+            slot.expert = -1;
+            slot.generation = ++next_generation_;
+            slot.last_use = 0;
+            slot.pins = 0;
+            slot.uploaded_mask = 0;
+        }
+}
+
 GpuExpertPool::Lease GpuExpertPool::reserve(int layer, int expert) {
     std::lock_guard<std::mutex> lock(mu_);
     if (layer < 0 || size_t(layer) >= slots_.size() || expert < 0 || expert >= n_expert_) return {};

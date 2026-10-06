@@ -25,6 +25,8 @@ target_link_libraries(bmoe_gpu_expert_pool_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME gpu_expert_pool COMMAND bmoe_gpu_expert_pool_test)
 set_tests_properties(gpu_expert_pool PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+add_executable(bmoe_gpu_agent_state_gate gpu_agent_state_gate.cpp)
+target_link_libraries(bmoe_gpu_agent_state_gate PRIVATE bmoe_core)
 add_executable(bmoe_gpu_expert_matmul_test gpu_expert_matmul_test.cpp)
 target_link_libraries(bmoe_gpu_expert_matmul_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_matmul_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
@@ -128,6 +130,7 @@ add_test(NAME decide_policy COMMAND bmoe_decide_test)
 foreach(_test_target IN ITEMS
         bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_hybrid_prefill_gate bmoe_layer_tile_gate bmoe_prefill_cache_gate
         bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
+        bmoe_gpu_agent_state_gate
         bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test
         bmoe_cpu_expert_skip_test
         bmoe_chat_parse_test bmoe_think_control_test
@@ -157,6 +160,8 @@ add_test(NAME moe_make_tiny_model_layer_tile
 set_tests_properties(moe_make_tiny_model_layer_tile PROPERTIES FIXTURES_SETUP TINY_QWEN35MOE)
 add_test(NAME layer_tile_gate COMMAND bmoe_layer_tile_gate ${_layer_tile_model})
 set_tests_properties(layer_tile_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE)
+add_test(NAME gpu_agent_state_gate COMMAND bmoe_gpu_agent_state_gate ${_layer_tile_model})
+set_tests_properties(gpu_agent_state_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu)
 
 set(_prefill_cache_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-prefill-cache.gguf")
 add_test(NAME moe_make_tiny_model_prefill_cache
