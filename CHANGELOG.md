@@ -19,6 +19,11 @@ Semantic Versioning.
   hybrid trace, its cost-optimal boundaries match adaptive auto, so the
   runtime policy remains unchanged.
 
+### Documentation
+- Record the decode-endgame timing breakdown and the rejected two-wave I/O
+  screen. The layer-trace analyzer now shows first and later intervals per
+  layer without changing runtime behavior.
+
 ## [0.33.0] - 2026-10-05
 
 ### Added

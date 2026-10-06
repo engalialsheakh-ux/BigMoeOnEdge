@@ -731,6 +731,11 @@ closes — is the last layer's tail plus the final norm and LM head. The routing
 isolates anyway also close a segment (a barrier that exists untraced too, so it costs nothing
 extra); those rows carry the same `blk.<il>` name and simply sum into their layer.
 `scripts/decode-analyze.py compute` detects the granularity and prints the per-segment table.
+For layer traces it also groups the first observed interval of each layer and
+its later intervals. On the streamed MoE path, the top-k barrier usually splits
+these groups into work before and after routing without adding another trace
+barrier. The `post` interval includes the final layer's tail and output head;
+these intervals include waiting and transfers, so they are not kernel timings.
 
 ### `--io-trace` — one row per flash read
 

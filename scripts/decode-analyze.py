@@ -53,6 +53,30 @@ def cmd_compute_layers(meta, rows):
     print("\nNOTE: one barrier per layer - coalescing and the expert prefetch survive, so these\n"
           "      numbers sit close to an untraced run. No per-op detail inside a segment.\n")
 
+    # The streamer already isolates top-k. Consecutive rows for one layer therefore
+    # separate its first interval from later intervals without adding trace barriers.
+    by_step_layer = defaultdict(list)
+    phases = defaultdict(int)
+    for r in rows:
+        name = r["name"]
+        ns = int(r["wall_ns"])
+        if name in ("pre", "post"):
+            phases[name] += ns
+        elif int(r["layer"]) >= 0:
+            by_step_layer[int(r["turn"]), int(r["step"]), int(r["layer"])].append(r)
+        else:
+            phases["other"] += ns
+    for intervals in by_step_layer.values():
+        intervals.sort(key=lambda row: int(row["seq"]))
+        phases["layer first"] += int(intervals[0]["wall_ns"])
+        phases["layer later"] += sum(int(row["wall_ns"]) for row in intervals[1:])
+    print("interval placement (first/later are split at each layer's first observed boundary)")
+    for name in ("pre", "layer first", "layer later", "post", "other"):
+        ns = phases[name]
+        if ns:
+            print(f"  {name:<13}{fmt_ms(ns/max(1,n_steps))} ms/token  {ns/total*100:5.1f}%")
+    print("  post includes the final layer's tail and the output head; intervals are not kernel timings.\n")
+
     by_seg = defaultdict(lambda: [0, 0])  # ns, majflt
     for r in rows:
         e = by_seg[r["name"]]
