@@ -444,6 +444,8 @@ struct RunConfig {
     std::string model_path;
     // Optional single hybrid sequence checkpoint file for repeated agent prompts.
     std::string agent_state_cache_path;
+    // Optional stable Claude Code prefix checkpoint, independent of the rolling agent state.
+    std::string claude_prefix_cache_path;
     std::string prompt = "The capital of Japan is";
     int n_predict = 128;
     int n_threads = 4;

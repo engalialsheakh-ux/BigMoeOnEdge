@@ -558,7 +558,8 @@ extends to them naturally.
 Requests (stdin):
 
 ```
-{"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>}
+{"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>,
+ "claude_prefix":"<optional stable beginning of prompt>","claude_prewarm":<bool>}
 {"cmd":"decide","id":<int>,"prefix":"<string>","suffix":"<string>","choices":["<string>",...],
  "reuse_prefix":<bool>}   # needs --decide; always rendered with reasoning off; see decide.md
 {"cmd":"cancel"}          # interrupt the in-flight generation; the session stays loaded
@@ -570,6 +571,11 @@ default to the process's flags / `true`. `clear_kv:true` starts a **new chat** (
 the engine-held conversation); `clear_kv:false` **continues** the conversation — send only the new
 user message, the engine re-renders the whole history and reuses the KV prefix (see
 [session.md](session.md)). `cancel` may arrive at any time, including mid-generation.
+`claude_prefix` is used only with `--claude-prefix-cache`: it must be an exact
+beginning of `prompt` and is tokenized through the same chat template before a
+separate stable checkpoint is captured. See [claude-prefix-cache.md](claude-prefix-cache.md).
+`claude_prewarm:true` (default false) suppresses rolling checkpoint use and
+capture for a zero-output startup prewarm, leaving conversation state intact.
 
 Responses (stdout):
 

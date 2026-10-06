@@ -36,6 +36,7 @@ class IIoTraceSink;
 struct SessionConfig {
     std::string model_path;
     std::string agent_state_cache_path;
+    std::string claude_prefix_cache_path;
     int n_threads = 4;
     int n_ctx = 2048;
     int n_batch = 512; // prefill chunk capacity; longer prompts are prefilled in n_batch slices
@@ -92,6 +93,9 @@ const char * think_control_name(ThinkControl c);
 // expert cache stays warm; clear_kv=false continues the KV cache for multi-turn chat.
 struct GenerateRequest {
     std::string prompt;
+    // Exact stable beginning of prompt, before conversation content. Empty disables capture.
+    std::string claude_prefix;
+    bool claude_prewarm = false; // restore/capture the stable prefix without replacing rolling state
     int n_predict = 32;
     bool think = true;
     bool clear_kv = true;

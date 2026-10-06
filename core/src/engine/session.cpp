@@ -324,6 +324,7 @@ struct AgentStateCache {
     std::vector<uint8_t> state;
     bool disk_checked = false;
     bool restore_failed = false;
+    bool disk_rejected = false;
 
     bool matches(const std::vector<llama_token> & prompt) const {
         return !state.empty() && !tokens.empty() && tokens.size() < prompt.size() &&
@@ -335,6 +336,7 @@ struct AgentStateCache {
         if (path.empty() || key == 0) return;
         std::ifstream in(path, std::ios::binary | std::ios::ate);
         if (!in) return;
+        disk_rejected = true;
         const std::streamoff file_bytes = in.tellg();
         if (file_bytes < 0 || uint64_t(file_bytes) > max_state_bytes + 1024ull * 1024ull) return;
         in.seekg(0);
@@ -361,6 +363,12 @@ struct AgentStateCache {
         if (!in || hash_bytes(token_hash, loaded_state.data(), loaded_state.size()) != checksum) return;
         tokens = std::move(loaded_tokens);
         state = std::move(loaded_state);
+        disk_rejected = false;
+    }
+
+    size_t match_count(const std::vector<llama_token> & prompt) {
+        if (!disk_checked && state.empty()) read_disk();
+        return matches(prompt) ? tokens.size() : 0;
     }
 
     size_t restore(llama_context * ctx, const std::vector<llama_token> & prompt) {
@@ -428,6 +436,7 @@ struct AgentStateCache {
 struct Session::Impl {
     SessionConfig cfg;
     AgentStateCache agent_cache;
+    AgentStateCache claude_cache;
     std::string arch;
     double load_seconds = 0.0;
 
@@ -605,7 +614,8 @@ struct Session::Impl {
         return !gpu_worker_failed.load(std::memory_order_acquire);
     }
     int decode_target(llama_context * c, const llama_batch & b) {
-        if (!cfg.agent_state_cache_path.empty() && !drain_gpu_worker()) return -1;
+        if ((!cfg.agent_state_cache_path.empty() || !cfg.claude_prefix_cache_path.empty()) && !drain_gpu_worker())
+            return -1;
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
         const int result = llama_decode(c, b);
@@ -615,7 +625,8 @@ struct Session::Impl {
                    : result;
     }
     int decode_placed(llama_context * c, const llama_batch & b, int layer_tile_tokens = 0) {
-        if (!cfg.agent_state_cache_path.empty() && !drain_gpu_worker()) return -1;
+        if ((!cfg.agent_state_cache_path.empty() || !cfg.claude_prefix_cache_path.empty()) && !drain_gpu_worker())
+            return -1;
         set_gpu_graph_for_batch(c, b);
         if (hook) hook->begin_gpu_decode();
         const int result = layer_tile_tokens > 0 && b.n_tokens > cfg.n_ubatch
@@ -1055,10 +1066,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
          cfg.decide.enabled || cfg.spec.enabled()))
         return fail("CUDA hybrid currently supports exact streaming without row-stream, routing policies, "
                     "speculation, decide, or prefetch");
-    if (!cfg.agent_state_cache_path.empty() &&
+    if ((!cfg.agent_state_cache_path.empty() || !cfg.claude_prefix_cache_path.empty()) &&
         (cfg.spec.enabled() || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
          cfg.moe.substitute_lambda > 0.0f || cfg.moe.route_ahead > 0))
         return fail("agent state cache requires greedy sampling and exact, unspeculated routing");
+    if (!cfg.claude_prefix_cache_path.empty() && cfg.claude_prefix_cache_path == cfg.agent_state_cache_path)
+        return fail("Claude prefix cache and rolling agent state cache need different files");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
@@ -1069,6 +1082,13 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         im.agent_cache.path = cfg.agent_state_cache_path;
         im.agent_cache.key = agent_state_key(cfg);
         if (im.agent_cache.key == 0) return fail("agent state cache cannot identify the model file");
+    }
+    if (!cfg.claude_prefix_cache_path.empty()) {
+        im.claude_cache.path = cfg.claude_prefix_cache_path;
+        const uint64_t model_key = agent_state_key(cfg);
+        if (model_key == 0) return fail("Claude prefix cache cannot identify the model file");
+        constexpr char format[] = "claude-bridge-prefix-v2|chat-template-v1";
+        im.claude_cache.key = hash_bytes(model_key, format, sizeof(format) - 1);
     }
 
     // llama_backend_init/free is process-global and reference counted; init here, free in ~Impl.
@@ -1826,7 +1846,7 @@ RunResult Session::generate(const GenerateRequest & req,
     // clear_kv = "new chat": drop the KV and the engine-held conversation. Otherwise this turn
     // continues the conversation, reusing the KV prefix already decoded from earlier turns.
     if (req.clear_kv) {
-        if (im.agent_cache.key && im.gpu_experts.buffer()) {
+        if ((im.agent_cache.key || im.claude_cache.key) && im.gpu_experts.buffer()) {
             if (!im.drain_gpu_worker()) return fail("GPU expert promotion failed before state restore");
             // Each independent agent request starts with the same empty logical VRAM residency.
             im.gpu_experts.clear_residency();
@@ -1895,6 +1915,43 @@ RunResult Session::generate(const GenerateRequest & req,
         return fail("prompt + n_predict exceeds the session n_ctx (" + std::to_string(im.cfg.n_ctx) +
                     "); open the session with a larger n_ctx");
 
+    // The bridge marks only text preceding Claude's conversation. Tokenize it through the same
+    // chat template and retain only the exact common token prefix; BPE may merge at its edge.
+    size_t claude_checkpoint = 0;
+    if (im.claude_cache.key && req.clear_kv && !req.claude_prefix.empty() &&
+        req.prompt.compare(0, req.claude_prefix.size(), req.claude_prefix) == 0) {
+        try {
+            std::string rendered = req.claude_prefix;
+            if (chat_on) {
+                common_chat_msg prefix_msg;
+                prefix_msg.role = "user";
+                prefix_msg.content = req.claude_prefix;
+                common_chat_templates_inputs prefix_inputs;
+                detail::build_turn_inputs(prefix_inputs, {prefix_msg}, req.think, im.think_ctl);
+                rendered = common_chat_templates_apply(im.chat_tmpls.get(), prefix_inputs).prompt;
+            }
+            std::vector<llama_token> prefix_tokens(rendered.size() + 8);
+            int n_prefix = llama_tokenize(im.vocab, rendered.c_str(), (int) rendered.size(), prefix_tokens.data(),
+                                          (int) prefix_tokens.size(), true, true);
+            if (n_prefix < 0) {
+                prefix_tokens.resize(-n_prefix);
+                n_prefix = llama_tokenize(im.vocab, rendered.c_str(), (int) rendered.size(), prefix_tokens.data(),
+                                          (int) prefix_tokens.size(), true, true);
+            }
+            if (n_prefix > 0) {
+                const size_t limit = std::min(size_t(n_prefix), tokens.size() - 1);
+                while (claude_checkpoint < limit && prefix_tokens[claude_checkpoint] == tokens[claude_checkpoint])
+                    ++claude_checkpoint;
+                if (claude_checkpoint >= 1024)
+                    claude_checkpoint = claude_checkpoint / 512 * 512;
+                else if (claude_checkpoint >= 128)
+                    claude_checkpoint = claude_checkpoint / 64 * 64;
+            }
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "bmoe: Claude prefix capture unavailable (%s); using exact cold prefill\n", e.what());
+        }
+    }
+
     // The text to surface: with chat on, parse the raw output so a reasoning model's internal
     // thinking is separated from the answer. The answer is shown inline; the reasoning is handed to
     // the UI as a distinct thinking block rather than dropped, so a Thinking-on run does not sit on a
@@ -1950,20 +2007,40 @@ RunResult Session::generate(const GenerateRequest & req,
 
     // Agent requests normally start a fresh raw prompt. A matching checkpoint restores the
     // attention and recurrent state before only the changing suffix is fed to the model.
-    if (req.clear_kv && im.agent_cache.key != 0) {
+    if (req.clear_kv && (im.agent_cache.key || im.claude_cache.key)) {
         const auto t_restore = clock_t_::now();
-        const size_t restored = im.agent_cache.restore(ctx, tokens);
-        if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1)) {
-            n_common = restored;
-            if (chat_on) im.kv_tokens = im.agent_cache.tokens;
-            std::fprintf(stderr, "bmoe: agent state cache hit: %zu tokens, %.1f MiB, restore %.3f s\n", restored,
-                         double(im.agent_cache.state.size()) / (1024.0 * 1024.0), secs(t_restore, clock_t_::now()));
-        } else if (im.agent_cache.restore_failed || restored) {
+        const size_t rolling_match = req.claude_prewarm ? 0 : im.agent_cache.match_count(tokens);
+        const size_t claude_match = im.claude_cache.match_count(tokens);
+        if (im.agent_cache.disk_rejected)
+            std::fprintf(stderr, "bmoe: rolling agent state cache rejected incompatible or corrupt snapshot\n");
+        if (im.claude_cache.disk_rejected)
+            std::fprintf(stderr, "bmoe: Claude prefix cache rejected incompatible or corrupt snapshot\n");
+        im.agent_cache.disk_rejected = false;
+        im.claude_cache.disk_rejected = false;
+        AgentStateCache * first = claude_match > rolling_match ? &im.claude_cache : &im.agent_cache;
+        AgentStateCache * second = first == &im.claude_cache ? &im.agent_cache : &im.claude_cache;
+        for (AgentStateCache * candidate : {first, second}) {
+            if (req.claude_prewarm && candidate == &im.agent_cache) continue;
+            if (!candidate->match_count(tokens)) continue;
+            const size_t restored = candidate->restore(ctx, tokens);
+            if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1)) {
+                n_common = restored;
+                if (chat_on) im.kv_tokens = candidate->tokens;
+                std::fprintf(stderr, "bmoe: %s cache hit: %zu tokens, suffix %zu tokens, %.1f MiB, restore %.3f s\n",
+                             candidate == &im.claude_cache ? "Claude prefix" : "rolling agent state", restored,
+                             tokens.size() - restored, double(candidate->state.size()) / (1024.0 * 1024.0),
+                             secs(t_restore, clock_t_::now()));
+                break;
+            }
             im.clear_memory(ctx);
-            im.agent_cache.state.clear();
-            im.agent_cache.tokens.clear();
-            std::fprintf(stderr, "bmoe: agent state cache rejected invalid state; prefilling cold\n");
+            candidate->state.clear();
+            candidate->tokens.clear();
+            std::fprintf(stderr, "bmoe: %s cache rejected invalid restored state; trying next exact prefix\n",
+                         candidate == &im.claude_cache ? "Claude prefix" : "rolling agent state");
         }
+        if (!n_common && claude_checkpoint)
+            std::fprintf(stderr, "bmoe: Claude prefix cache miss: candidate %zu tokens; exact cold prefill\n",
+                         claude_checkpoint);
     }
 
     // Roll this turn back to the state before it started: drop the KV added this turn, forget the
@@ -2073,12 +2150,13 @@ RunResult Session::generate(const GenerateRequest & req,
     const uint64_t arena_read0 = im.prefill ? im.prefill->arena_read_bytes() : 0;
     const double arena_stall0 = im.prefill ? im.prefill->arena_stall_seconds() : 0.0;
     const long long device_nodes0 = im.hook->device_nodes();
-    const size_t checkpoint = im.agent_cache.key == 0 || n_prompt <= 128 ? 0
-                              : n_prompt > 1024                          ? size_t((n_prompt - 1) / 512 * 512)
-                                                                         : size_t((n_prompt - 1) / 64 * 64);
+    const size_t checkpoint = req.claude_prewarm || im.agent_cache.key == 0 || n_prompt <= 128 ? 0
+                              : n_prompt > 1024 ? size_t((n_prompt - 1) / 512 * 512)
+                                                : size_t((n_prompt - 1) / 64 * 64);
     for (int i = (int) n_common; i < n_prompt;) {
         int chunk = std::min(pf_step, n_prompt - i);
         if (checkpoint > size_t(i) && checkpoint < size_t(i + chunk)) chunk = int(checkpoint) - i;
+        if (claude_checkpoint > size_t(i) && claude_checkpoint < size_t(i + chunk)) chunk = int(claude_checkpoint) - i;
         if (im.prefill) {
             const bool on_dev = chunk >= im.cfg.prefill.min_tokens;
             im.place_prefill(on_dev);
@@ -2117,6 +2195,11 @@ RunResult Session::generate(const GenerateRequest & req,
                              checkpoint, double(im.agent_cache.state.size()) / (1024.0 * 1024.0),
                              secs(t_capture, clock_t_::now()));
         }
+        if (claude_checkpoint != 0 && size_t(i) == claude_checkpoint &&
+            im.claude_cache.capture(ctx, tokens, claude_checkpoint))
+            std::fprintf(stderr, "bmoe: Claude prefix cache checkpoint: %zu tokens, suffix %zu tokens, %.1f MiB\n",
+                         claude_checkpoint, tokens.size() - claude_checkpoint,
+                         double(im.claude_cache.state.size()) / (1024.0 * 1024.0));
     }
     im.place_prefill(false); // decode reads the host bindings
     const long long prefill_device_nodes = im.hook->device_nodes() - device_nodes0;

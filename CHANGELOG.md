@@ -20,6 +20,10 @@ Semantic Versioning.
   runtime policy remains unchanged.
 
 ### Documentation
+- Add an independent, exact Claude Code prefix checkpoint beside the rolling
+  agent state. The Claude bridge learns the stable serialized prefix from a
+  first request, prewarms it on later startups, and logs restored versus
+  newly evaluated tokens. A focused CUDA gate covers restart and output identity.
 - Record the decode-endgame timing breakdown and the rejected two-wave I/O
   screen. The layer-trace analyzer now shows first and later intervals per
   layer without changing runtime behavior.

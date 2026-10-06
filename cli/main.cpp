@@ -251,6 +251,8 @@ static bool json_get_bool(const std::string & line, const char * key, bool dflt)
 struct SessionCmd {
     enum Kind { kGenerate, kDecide, kClose } kind;
     std::string prompt;
+    std::string claude_prefix;
+    bool claude_prewarm = false;
     int id = 0;
     int n_predict = 128;
     bool think = true;
@@ -353,6 +355,8 @@ static int run_session_loop(const RunConfig & cfg,
             } else if (cmd == "generate") {
                 c.kind = SessionCmd::kGenerate;
                 json_get_string(line, "prompt", c.prompt);
+                json_get_string(line, "claude_prefix", c.claude_prefix);
+                c.claude_prewarm = json_get_bool(line, "claude_prewarm", false);
                 c.id = json_get_int(line, "id", 0);
                 c.n_predict = json_get_int(line, "n_predict", cfg.n_predict);
                 c.think = json_get_bool(line, "think", cfg.think);
@@ -409,6 +413,8 @@ static int run_session_loop(const RunConfig & cfg,
 
         GenerateRequest req;
         req.prompt = cmd.prompt;
+        req.claude_prefix = cmd.claude_prefix;
+        req.claude_prewarm = cmd.claude_prewarm;
         req.n_predict = cmd.n_predict;
         req.think = cmd.think;
         req.clear_kv = cmd.clear_kv;
@@ -516,6 +522,8 @@ static void print_usage(const char * argv0) {
         "      --agent-state-cache FILE  save one exact hybrid prefix checkpoint and reuse it\n"
         "                          across requests and process restarts when tokens/config match\n"
         "                          GPU expert promotions replay in deterministic token order\n"
+        "      --claude-prefix-cache FILE  separate stable Claude Code prefix checkpoint; session\n"
+        "                          requests provide claude_prefix for exact capture\n"
         "      --decide            with --session: accept decide requests (pick one of a list of\n"
         "                          choices from a single prefill, no decode). Off by default\n"
         "      --decide-prefix-cache M\n"
@@ -846,6 +854,8 @@ int main(int argc, char ** argv) {
                 cfg.gpu.cache_type_v = type;
         } else if (a == "--agent-state-cache") {
             cfg.agent_state_cache_path = next(a.c_str());
+        } else if (a == "--claude-prefix-cache") {
+            cfg.claude_prefix_cache_path = next(a.c_str());
         } else if (a == "--flash-attn") {
             const std::string mode = next("--flash-attn");
             if (mode == "auto")
