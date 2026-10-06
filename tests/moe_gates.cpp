@@ -1180,7 +1180,10 @@ int main(int argc, char ** argv) {
 
             // f) off by default: the same session (decide not enabled) refuses, without harm.
             const DecideResult off = s->decide(q1);
-            const RunResult after = s->generate(GenerateRequest{stream0.prompt, stream0.n_predict});
+            GenerateRequest after_request;
+            after_request.prompt = stream0.prompt;
+            after_request.n_predict = stream0.n_predict;
+            const RunResult after = s->generate(after_request);
             if (off.ok || off.fatal || !after) {
                 std::printf("[FAIL] G18f decide off must refuse, not fatally (ok=%d fatal=%d, generate after: %s)\n",
                             (int) off.ok, (int) off.fatal, after ? "ok" : after.error.c_str());

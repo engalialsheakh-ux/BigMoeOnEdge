@@ -6,13 +6,15 @@ The starting point is the exact persistent-agent configuration in the
 1,500 MiB GPU expert cache, 128 MiB GPU safety reserve, six affined compute
 threads, four direct-I/O lanes, and overlap. The frozen long result restored
 17,408 of 17,663 prompt tokens, reached first response in 9.717 s, and decoded
-1,292 identical tokens at 9.261 tokens/s. No 64K prefill run or new 17K cold
-prefill was performed for this investigation.
+1,292 identical tokens at 9.261 tokens/s. This is a historical, pre-release-mmap
+run; the active post-release-mmap expert I/O stall baseline is about 29 ms/token
+overall and about 25 ms/token over tokens 129-256. No 64K prefill run or new
+17K cold prefill was performed for this investigation.
 
 ## Where a token spends time
 
-The prior 1,292-token restored run averaged about 108.0 ms per generated token.
-Its existing counters assigned 38.0 ms to non-overlapped expert-read stall,
+The historical 1,292-token restored run averaged about 108.0 ms per generated token.
+Its pre-release-mmap counters assigned 38.0 ms to non-overlapped expert-read stall,
 10.7 ms to expert-cache management, and 59.3 ms to the residual named
 `compute_ms`. That last field is **not** a measurement of arithmetic: it also
 contains waiting and scheduling. The run streamed 110,867 MiB in total, about
@@ -39,8 +41,10 @@ partitions its 81 intervals per token as follows:
 In this MoE graph, top-k separates each layer's first and later intervals.
 The 81.30 ms group contains expert reads, CPU and GPU expert execution,
 activation movement, and synchronization. Its non-overlapped storage waits
-are the largest measured subcost (about 40 ms/token in the matched 128-token
-untraced run); it is incorrect to call the whole group CPU compute. A previous
+were the largest measured subcost in that earlier run (about 40 ms/token in its
+matched 128-token untraced screen). The active post-release-mmap baseline is
+about 29 ms/token overall and 25 ms/token over tokens 129-256; it is incorrect
+to call the whole group CPU compute. A previous
 per-node trace found `MUL_MAT_ID` prominent, but its roughly 4,187 barriers per
 token inflated runtime to 319 ms/token and cannot establish an untraced
 CPU/GPU kernel saving.
@@ -55,7 +59,7 @@ identical text, GPU-hit counts, SSD byte counts, and promotion counts within
 each matched pair. The 256-token pair ran in the reverse order from the
 128-token pair to expose order-sensitive short-run gains.
 
-| Completion | Current I/O | Two-wave I/O | Result |
+| Completion | Earlier baseline I/O | Two-wave I/O | Result |
 | --- | ---: | ---: | --- |
 | 128 tokens, decode tokens/s | 8.408 | 8.810 | Two-wave +4.8% |
 | 128 tokens, stall ms/token | 40.1 | 37.9 | Two-wave -2.2 ms |
@@ -82,13 +86,41 @@ not a live speed measurement.
 Prior CUDA-launch analysis placed its optimistic saving at about 3 ms/token,
 and the installed CUDA backend already uses the eligible fused expert path.
 
-The current 9.261 tokens/s, 9.717 s restored first response, exact replay,
-and memory budget remain the accepted result. No production inference code or
-llama.cpp source changed. A material step toward 11 tokens/s requires saving
-roughly 17 ms of the current 108 ms token, most plausibly by starting *exact*
+The historical 9.261 tokens/s, 9.717 s restored first response, exact replay,
+and memory budget remain the result of this earlier investigation. No production
+inference code or llama.cpp source changed. A material step from that result
+toward 11 tokens/s would require saving roughly 17 ms of its 108 ms token,
+most plausibly by starting *exact*
 expert reads before their layer stalls without adding speculative flash
 traffic. That would need a verified early-router/graph schedule and bounded
 staging across the CUDA hybrid boundary; the present CUDA mode deliberately
 disallows the existing prediction and prefetch policies. Such work needs a
 separate measured design and correctness gate. The single largest remaining
 bottleneck is routed-expert execution, particularly its unhidden storage wait.
+
+## Follow-up exactness and capacity audit
+
+An optional expert-residency manifest prototype restored 2,607 RAM experts
+(4,399.3 MiB) from an existing Claude prefix snapshot in 2.35 s. In one
+128-token restart pair, startup through the completed answer took 38.327 s
+without the manifest and 38.065 s with it. The generated text differed.
+Two independent 128-token runs without the prototype produced identical text
+hashes and identical expert read volume. The prototype was removed: its
+roughly 0.7% end-to-end saving does not justify enabling a path that failed
+the exact-output screen. The production Claude bridge remains unchanged.
+
+Elastic GPU KV capacity is DEFERRED-BLOCKED by the current storage layout. For
+this hybrid model, memory creation in `llama-model.cpp` passes `cparams.n_ctx_seq` as
+`attn_kv_size` to `llama_memory_hybrid`, whose attention member is a
+`llama_kv_cache`. Its constructor creates full-`kv_size` K/V tensors with
+`ggml_new_tensor_3d` and immediately allocates their backend storage with
+`ggml_backend_alloc_ctx_tensors_from_buft`. The cache's `state_write_data` and
+`state_read_data` address saved cells through the current cache dimensions;
+`state_read_meta` also finds slots in the already-sized cell array. A growing
+physical layout must preserve those serialized positions and exact prefix
+restore. Separately, `GpuExpertPool::init` fixes slot counts and offsets from
+the configured budget, then allocates one device buffer of that budget. Using
+freed KV VRAM for experts and later returning it would require coordinated KV
+growth, compatible state read/write, and pool resizing only after uploads and
+graph pins drain. A flag or one allocator edit cannot safely provide that
+single-sequence behavior while retaining the 262,144-token logical context.
