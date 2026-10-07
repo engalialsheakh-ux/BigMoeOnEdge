@@ -90,6 +90,15 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.gpu.safety_mb < 128) {
         return fail("gpu.safety_mb must be >= 128");
     }
+    if (cfg.gpu.elastic_kv && (cfg.gpu.elastic_kv_chunk_tokens < 512 || cfg.gpu.elastic_kv_chunk_tokens > 32768 ||
+                               (cfg.gpu.elastic_kv_chunk_tokens & (cfg.gpu.elastic_kv_chunk_tokens - 1)) != 0)) {
+        return fail("gpu.elastic_kv_chunk_tokens must be a power of two in [512,32768]");
+    }
+    if (cfg.gpu.elastic_kv && (cfg.gpu.n_gpu_layers != -1 || !cfg.gpu.kv_offload || !cfg.moe.enabled ||
+                               (cfg.spec.enabled() && !cfg.spec.is_mtp()) || cfg.prefill.enabled() || cfg.decide.enabled)) {
+        return fail(
+            "elastic KV requires full CUDA MoE streaming and GPU KV, without non-MTP speculation, prefill device, or decide");
+    }
     if (cfg.gpu.expert_cache_window < 1 || cfg.gpu.expert_cache_window > 64) {
         return fail("gpu.expert_cache_window must be in [1,64]");
     }
@@ -117,10 +126,11 @@ ValidationResult validate(const RunConfig & cfg) {
     }
     const int tile = cfg.layer_tile_tokens;
     if (tile != 0 && (tile != -1 && (tile < 512 || tile > 8192 || (tile & (tile - 1)) != 0) || cfg.n_ubatch != 64 ||
-                      cfg.n_ctx < 512 || (tile > 0 && tile > cfg.n_ctx) || cfg.spec.enabled() ||
+                      cfg.n_ctx < 512 || (tile > 0 && tile > cfg.n_ctx) ||
+                      (cfg.spec.enabled() && !cfg.spec.is_mtp()) ||
                       cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled)) {
         return fail("prefill.layer_tile_tokens requires auto or a power-of-two tile from 512 to 8192, --ubatch 64, "
-                    "--moe-stream, full CUDA placement, and no speculation or prefill device");
+                    "--moe-stream, full CUDA placement, and no non-MTP speculation or prefill device");
     }
     // Lower bound only: 0 means "use the model default". The upper bound (<= the model's
     // real expert count) needs the loaded gguf, so it is deferred to run() where the model

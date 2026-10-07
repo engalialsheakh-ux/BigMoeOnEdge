@@ -503,6 +503,8 @@ struct RunConfig {
         int expert_cache_window = 8;      // prior miss must recur within this many decode tokens
         bool expert_cache_promote = true; // control for all-miss correctness probes
         bool kv_offload = true;
+        bool elastic_kv = false;             // grow physical KV context in chunks; logical n_ctx is unchanged
+        int elastic_kv_chunk_tokens = 32768; // fixed production chunk; smaller values exercise growth in gates
         FlashAttention flash_attn = FlashAttention::Auto;
         KvCacheType cache_type_k = KvCacheType::F16;
         KvCacheType cache_type_v = KvCacheType::F16;

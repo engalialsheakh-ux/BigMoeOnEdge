@@ -557,6 +557,7 @@ static void print_usage(const char * argv0) {
         "      --gpu-expert-no-promote  keep the VRAM pool empty for an all-miss correctness probe\n"
         "      --gpu-expert-window N  admit an expert reused within N decode tokens (default 8)\n"
         "      --no-kv-offload     keep KV and KQV operations on CPU\n"
+        "      --elastic-kv        opt-in: grow physical GPU KV capacity in 32K-token chunks\n"
         "      --cache-type-k T    KV key cache: f16 (default) | q8_0 | q4_0\n"
         "      --cache-type-v T    KV value cache: f16 (default) | q8_0 | q4_0\n"
         "      --flash-attn M      auto (default) | on | off\n"
@@ -841,6 +842,8 @@ int main(int argc, char ** argv) {
             }
         } else if (a == "--no-kv-offload")
             cfg.gpu.kv_offload = false;
+        else if (a == "--elastic-kv")
+            cfg.gpu.elastic_kv = true;
         else if (a == "--cache-type-k" || a == "--cache-type-v") {
             const char * value = next(a.c_str());
             RunConfig::GpuConfig::KvCacheType type;

@@ -8,6 +8,28 @@ Unlike [turbo top-k](../README.md#trading-quality-for-speed) and
 when it equals the target model's own argmax at that position, so nothing is approximated and no
 weight is skipped. The quality is the full model's.
 
+## Embedded Qwen3.6 production path on Windows
+
+The Claude bridge uses `Qwen3.6-35B-A3B-Q4_K_M-MTP.gguf`, a combined GGUF with
+the original Q4_K_M weights and 20 NextN tensors in `blk.40.*`. `--mtp --draft 2
+--mtp-p-min 0` creates target and draft contexts over one loaded model. Their
+schedulers and sequence states are independent while their physical compute
+backing is shared. The target keeps a 1,500 MiB GPU expert cache (848 slots),
+4,400 MiB RAM expert cache, 128 MiB GPU safety reserve, release-mmap, GPU Q4_0
+K/V, and a logical context of 262,144 tokens. `--elastic-kv` starts physical KV
+at 32,768 cells and grows it without reloading weights. Rolling agent and
+stable Claude prefix checkpoints include both target and MTP draft states;
+older or mismatched checkpoints are rejected by their model/configuration key.
+
+The same-GGUF 128-token screen measured 7.227 tokens/s without MTP and 7.97
+effective tokens/s with MTP, including draft time (+10.3%). Draft width 2
+accepted 79/98 tokens (80.6%). Plain and MTP greedy transcripts differed, so
+the production classification is **KEEP-LOSSLESS-ONLY**: every committed draft
+is verified by the target, while different batch arithmetic may change its
+argmax. At a real 32,768-cell boundary, native MTP grew physical KV to 65,536
+cells, reattached shared compute backing, and returned the exact same 32-token
+continuation bytes as a no-growth restore from the same saved prefix.
+
 ## It is exact, but it is not bit-reproducible
 
 Read that claim precisely, because it is weaker than the one the rest of this engine makes.

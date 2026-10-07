@@ -149,6 +149,20 @@ and the synthetic/real-model gates before reviewing or publishing this fork
 delta. The parent submodule pin includes both local commits; no public branch
 has moved.
 
+## Elastic hybrid attention KV capacity (local source delta)
+
+The opt-in `--elastic-kv` path adds `llama_context_params.n_kv` to separate
+physical hybrid attention-KV storage from logical `n_ctx_seq`. The default
+`n_kv=0` resolves to `n_ctx_seq`, preserving existing callers. In
+`llama_model::create_memory`, the hybrid attention member receives `n_kv`;
+the recurrent/SSM member is unchanged. The small public capacity and byte
+getters report the allocated attention cache. BigMoe uses the public sequence
+state API to snapshot and restore around context recreation, retaining the
+loaded `llama_model`. This delta is committed in the pinned llama.cpp submodule revision. The focused `elastic_kv_gate` checks
+logical context, live-state migration, greedy output, and agent/Claude prefix
+restart restore. The trial GPU expert-pool resizing code was removed after a
+real-model greedy-output mismatch.
+
 ## The chat glue: llama.cpp `common` (not the streaming seam)
 
 Separate from the two streaming hooks above, `session.cpp` links llama.cpp's `common`

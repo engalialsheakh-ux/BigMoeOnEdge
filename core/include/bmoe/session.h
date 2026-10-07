@@ -20,6 +20,7 @@
 #include "bmoe/runtime.h"
 
 #include <functional>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -201,6 +202,9 @@ public:
     double load_seconds() const;      // model load + streaming setup, measured once at open()
     const std::string & arch() const; // model architecture ("qwen3moe", "gemma4", …)
     int n_ctx() const;
+    int physical_kv_tokens() const;
+    size_t physical_kv_bytes() const;
+    int kv_growth_count() const;
 
     // Experts this model actually routes per token, after any n_expert_used override — the width a
     // caller needs to interpret MoeStreamConfig::drop_cold_frac, whose threshold is a fraction of

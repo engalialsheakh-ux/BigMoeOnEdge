@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -313,7 +314,15 @@ uint64_t agent_state_key(const SessionConfig & cfg) {
              << cfg.moe.substitute_lambda << '|' << cfg.moe.route_ahead << '|' << cfg.prefill.device << '|'
              << cfg.prefill.min_tokens << '|' << cfg.prefill.routed << '|' << cfg.prefill.routed_full_frac << '|';
     const std::string serialized = settings.str();
-    return hash_bytes(h, serialized.data(), serialized.size());
+    h = hash_bytes(h, serialized.data(), serialized.size());
+    if (cfg.spec.is_mtp()) {
+        const std::string mtp_settings = "mtp-state-v2|" + std::to_string(cfg.spec.draft_max) + "|" +
+                                         std::to_string(cfg.spec.draft_p_min) + "|" +
+                                         std::to_string(cfg.gpu.elastic_kv) + "|" +
+                                         std::to_string(cfg.gpu.elastic_kv_chunk_tokens);
+        h = hash_bytes(h, mtp_settings.data(), mtp_settings.size());
+    }
+    return h;
 }
 
 struct AgentStateCache {
@@ -322,6 +331,8 @@ struct AgentStateCache {
     uint64_t key = 0;
     std::vector<llama_token> tokens;
     std::vector<uint8_t> state;
+    std::vector<uint8_t> draft_state;
+    bool with_draft = false;
     bool disk_checked = false;
     bool restore_failed = false;
     bool disk_rejected = false;
@@ -341,28 +352,35 @@ struct AgentStateCache {
         if (file_bytes < 0 || uint64_t(file_bytes) > max_state_bytes + 1024ull * 1024ull) return;
         in.seekg(0);
         char magic[8];
-        uint64_t stored_key = 0, state_size = 0, checksum = 0;
+        uint64_t stored_key = 0, state_size = 0, draft_size = 0, checksum = 0;
         uint32_t token_count = 0;
         in.read(magic, sizeof(magic));
         in.read(reinterpret_cast<char *>(&stored_key), sizeof(stored_key));
         in.read(reinterpret_cast<char *>(&token_count), sizeof(token_count));
         in.read(reinterpret_cast<char *>(&state_size), sizeof(state_size));
+        if (with_draft) in.read(reinterpret_cast<char *>(&draft_size), sizeof(draft_size));
         in.read(reinterpret_cast<char *>(&checksum), sizeof(checksum));
         const uint64_t header_bytes =
-            sizeof(magic) + sizeof(stored_key) + sizeof(token_count) + sizeof(state_size) + sizeof(checksum);
-        if (!in || std::memcmp(magic, "BMOEAS01", 8) != 0 || stored_key != key || token_count == 0 ||
-            token_count > 262144 || state_size == 0 || state_size > max_state_bytes ||
-            uint64_t(file_bytes) != header_bytes + uint64_t(token_count) * sizeof(llama_token) + state_size)
+            sizeof(magic) + sizeof(stored_key) + sizeof(token_count) + sizeof(state_size) +
+            (with_draft ? sizeof(draft_size) : 0) + sizeof(checksum);
+        if (!in || std::memcmp(magic, with_draft ? "BMOEAS02" : "BMOEAS01", 8) != 0 || stored_key != key ||
+            token_count == 0 || token_count > 262144 || state_size == 0 || state_size > max_state_bytes ||
+            (with_draft && draft_size == 0) || draft_size > max_state_bytes - state_size ||
+            uint64_t(file_bytes) != header_bytes + uint64_t(token_count) * sizeof(llama_token) + state_size + draft_size)
             return;
         std::vector<llama_token> loaded_tokens(token_count);
         std::vector<uint8_t> loaded_state(static_cast<size_t>(state_size));
+        std::vector<uint8_t> loaded_draft(static_cast<size_t>(draft_size));
         in.read(reinterpret_cast<char *>(loaded_tokens.data()), std::streamsize(token_count * sizeof(llama_token)));
         in.read(reinterpret_cast<char *>(loaded_state.data()), std::streamsize(state_size));
+        if (draft_size) in.read(reinterpret_cast<char *>(loaded_draft.data()), std::streamsize(draft_size));
         const uint64_t token_hash =
             hash_bytes(14695981039346656037ull, loaded_tokens.data(), loaded_tokens.size() * sizeof(llama_token));
-        if (!in || hash_bytes(token_hash, loaded_state.data(), loaded_state.size()) != checksum) return;
+        const uint64_t state_hash = hash_bytes(token_hash, loaded_state.data(), loaded_state.size());
+        if (!in || hash_bytes(state_hash, loaded_draft.data(), loaded_draft.size()) != checksum) return;
         tokens = std::move(loaded_tokens);
         state = std::move(loaded_state);
+        draft_state = std::move(loaded_draft);
         disk_rejected = false;
     }
 
@@ -371,14 +389,16 @@ struct AgentStateCache {
         return matches(prompt) ? tokens.size() : 0;
     }
 
-    size_t restore(llama_context * ctx, const std::vector<llama_token> & prompt) {
+    size_t restore(llama_context * ctx, llama_context * draft, const std::vector<llama_token> & prompt) {
         restore_failed = false;
         if (!disk_checked && state.empty()) read_disk();
-        if (!matches(prompt)) return 0;
+        if (!matches(prompt) || (with_draft && (!draft || draft_state.empty()))) return 0;
         const size_t read = llama_state_seq_set_data(ctx, state.data(), state.size(), 0);
-        if (read != state.size()) {
+        const size_t draft_read = with_draft ? llama_state_seq_set_data(draft, draft_state.data(), draft_state.size(), 0) : 0;
+        if (read != state.size() || (with_draft && draft_read != draft_state.size())) {
             restore_failed = true;
             state.clear();
+            draft_state.clear();
             tokens.clear();
             return 0;
         }
@@ -386,22 +406,26 @@ struct AgentStateCache {
     }
 
     bool persist() const {
-        if (path.empty() || key == 0 || state.empty()) return false;
+        if (path.empty() || key == 0 || state.empty() || (with_draft && draft_state.empty())) return false;
         const std::string temp = path + ".tmp";
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) return false;
         const uint32_t token_count = static_cast<uint32_t>(tokens.size());
         const uint64_t state_size = state.size();
+        const uint64_t draft_size = draft_state.size();
         const uint64_t token_hash =
             hash_bytes(14695981039346656037ull, tokens.data(), tokens.size() * sizeof(llama_token));
-        const uint64_t checksum = hash_bytes(token_hash, state.data(), state.size());
-        out.write("BMOEAS01", 8);
+        const uint64_t state_hash = hash_bytes(token_hash, state.data(), state.size());
+        const uint64_t checksum = hash_bytes(state_hash, draft_state.data(), draft_state.size());
+        out.write(with_draft ? "BMOEAS02" : "BMOEAS01", 8);
         out.write(reinterpret_cast<const char *>(&key), sizeof(key));
         out.write(reinterpret_cast<const char *>(&token_count), sizeof(token_count));
         out.write(reinterpret_cast<const char *>(&state_size), sizeof(state_size));
+        if (with_draft) out.write(reinterpret_cast<const char *>(&draft_size), sizeof(draft_size));
         out.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
         out.write(reinterpret_cast<const char *>(tokens.data()), std::streamsize(tokens.size() * sizeof(llama_token)));
         out.write(reinterpret_cast<const char *>(state.data()), std::streamsize(state.size()));
+        if (with_draft) out.write(reinterpret_cast<const char *>(draft_state.data()), std::streamsize(draft_state.size()));
         out.close();
         if (!out) return false;
 #ifdef _WIN32
@@ -414,15 +438,26 @@ struct AgentStateCache {
 #endif
     }
 
-    bool capture(llama_context * ctx, const std::vector<llama_token> & prompt, size_t count) {
+    bool capture(llama_context * ctx, llama_context * draft, const std::vector<llama_token> & prompt, size_t count) {
         if (key == 0 || count == 0 || count >= prompt.size()) return false;
         if (tokens.size() == count && std::equal(tokens.begin(), tokens.end(), prompt.begin())) return false;
         const size_t bytes = llama_state_seq_get_size(ctx, 0);
         if (bytes == 0 || bytes > max_state_bytes) return false;
         std::vector<uint8_t> snapshot(bytes);
         if (llama_state_seq_get_data(ctx, snapshot.data(), snapshot.size(), 0) != bytes) return false;
+        std::vector<uint8_t> draft_snapshot;
+        if (with_draft) {
+            if (!draft) return false;
+            llama_synchronize(draft);
+            const size_t draft_bytes = llama_state_seq_get_size(draft, 0);
+            if (draft_bytes == 0 || draft_bytes > max_state_bytes - bytes) return false;
+            draft_snapshot.resize(draft_bytes);
+            if (llama_state_seq_get_data(draft, draft_snapshot.data(), draft_snapshot.size(), 0) != draft_bytes)
+                return false;
+        }
         tokens.assign(prompt.begin(), prompt.begin() + count);
         state = std::move(snapshot);
+        draft_state = std::move(draft_snapshot);
         disk_checked = true;
         if (!persist()) std::fprintf(stderr, "bmoe: agent state cache could not write %s\n", path.c_str());
         return true;
@@ -445,6 +480,9 @@ struct Session::Impl {
     // the context and model are freed. The destructor does that explicitly.
     std::unique_ptr<llama_model, void (*)(llama_model *)> model{nullptr, llama_model_free};
     std::unique_ptr<llama_context, void (*)(llama_context *)> ctx{nullptr, llama_free};
+    llama_context_params context_params{};
+    int physical_kv_tokens = 0;
+    int kv_growth_count = 0;
     std::unique_ptr<RouterHook> hook; // heap: its address is baked into cparams.cb_eval_user_data
     ExpertStreamSource source;
     GpuExpertPool gpu_experts;
@@ -614,6 +652,7 @@ struct Session::Impl {
         return !gpu_worker_failed.load(std::memory_order_acquire);
     }
     int decode_target(llama_context * c, const llama_batch & b) {
+        if (ctx_dft && c == ctx.get()) llama_synchronize(ctx_dft.get());
         if ((!cfg.agent_state_cache_path.empty() || !cfg.claude_prefix_cache_path.empty()) && !drain_gpu_worker())
             return -1;
         set_gpu_graph_for_batch(c, b);
@@ -649,6 +688,120 @@ struct Session::Impl {
     void clear_memory(llama_context * c) {
         llama_memory_clear(llama_get_memory(c), true);
         if (prefill) prefill->clear_state();
+    }
+
+    bool init_mtp_driver() {
+        common_params_speculative sp;
+        sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+        sp.draft.n_max = cfg.spec.draft_max;
+        sp.draft.n_min = 0;
+        sp.draft.p_min = cfg.spec.draft_p_min;
+        sp.draft.ctx_tgt = ctx.get();
+        sp.draft.ctx_dft = ctx_dft.get();
+        mtp.reset(common_speculative_init(sp, /*n_seq*/ 1));
+        return mtp != nullptr;
+    }
+
+    bool ensure_kv_capacity(int required_tokens, std::string & error) {
+        if (!cfg.gpu.elastic_kv || required_tokens <= physical_kv_tokens) return true;
+        const auto started = clock_t_::now();
+        const int chunk = cfg.gpu.elastic_kv_chunk_tokens;
+        const int target = int(std::min<int64_t>(cfg.n_ctx, (int64_t(required_tokens) + chunk - 1) / chunk * chunk));
+        if (target < required_tokens || !drain_gpu_worker()) {
+            error = "elastic KV cannot grow: capacity or GPU upload barrier failed";
+            return false;
+        }
+        llama_synchronize(ctx.get());
+        const size_t bytes = llama_state_seq_get_size(ctx.get(), 0);
+        std::vector<uint8_t> state;
+        try {
+            state.resize(bytes);
+        } catch (const std::bad_alloc &) {
+            error = "elastic KV could not allocate host memory for the hybrid state snapshot";
+            return false;
+        }
+        if (bytes && llama_state_seq_get_data(ctx.get(), state.data(), bytes, 0) != bytes) {
+            error = "elastic KV could not snapshot the current hybrid sequence state";
+            return false;
+        }
+
+        std::vector<uint8_t> draft_state;
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft.get());
+            const size_t draft_bytes = llama_state_seq_get_size(ctx_dft.get(), 0);
+            try {
+                draft_state.resize(draft_bytes);
+            } catch (const std::bad_alloc &) {
+                error = "elastic KV could not allocate host memory for the MTP state snapshot";
+                return false;
+            }
+            if (draft_bytes &&
+                llama_state_seq_get_data(ctx_dft.get(), draft_state.data(), draft_bytes, 0) != draft_bytes) {
+                error = "elastic KV could not snapshot the MTP sequence state";
+                return false;
+            }
+        }
+
+        // Recreating the context releases its KV buffers and captured graphs without reloading model weights.
+        const uint32_t old_capacity = context_params.n_kv;
+        mtp.reset();
+        ctx_dft.reset();
+        ctx.reset();
+        auto recreate = [&](uint32_t capacity) -> bool {
+            context_params.n_kv = capacity;
+            ctx.reset(llama_init_from_model(model.get(), context_params));
+            if (!ctx) return false;
+            llama_set_n_threads(ctx.get(), cfg.n_threads, cfg.n_threads);
+            llama_set_abort_callback(
+                ctx.get(),
+                [](void * ud) -> bool {
+                    auto * p = static_cast<Impl *>(ud);
+                    return p->cancel_requested.load(std::memory_order_relaxed) || p->source.fatal();
+                },
+                this);
+            if (bytes && llama_state_seq_set_data(ctx.get(), state.data(), bytes, 0) != bytes) return false;
+            if (cfg.spec.is_mtp()) {
+                llama_context_params dparams = context_params;
+                dparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                dparams.ctx_other = ctx.get();
+                dparams.ctx_other_share_compute = true;
+                dparams.n_rs_seq = 0;
+                dparams.n_ubatch = uint32_t(std::max(cfg.spec.draft_max + 1, mtp_draft_ubatch));
+                dparams.n_ubatch = std::min(dparams.n_ubatch, context_params.n_ubatch);
+                ctx_dft.reset(llama_init_from_model(model.get(), dparams));
+                if (!ctx_dft) return false;
+                llama_set_n_threads(ctx_dft.get(), cfg.n_threads, cfg.n_threads);
+                if (!draft_state.empty() &&
+                    llama_state_seq_set_data(ctx_dft.get(), draft_state.data(), draft_state.size(), 0) !=
+                        draft_state.size())
+                    return false;
+                if (!init_mtp_driver()) return false;
+            }
+            return true;
+        };
+
+        if (!recreate(uint32_t(target))) {
+            mtp.reset();
+            ctx_dft.reset();
+            ctx.reset();
+            const bool restored = recreate(old_capacity);
+            gpu_graph_attached = false;
+            if (hook) hook->reset_gpu_graph_discovery();
+            error = restored ? "elastic KV could not allocate or restore the larger context; previous state restored"
+                             : "elastic KV could not allocate the larger context or restore the previous state";
+            return false;
+        }
+        gpu_graph_attached = false;
+        if (hook) hook->reset_gpu_graph_discovery();
+        physical_kv_tokens = int(llama_get_kv_cache_capacity(ctx.get()));
+        ++kv_growth_count;
+        std::fprintf(stderr,
+                     "bmoe-elastic-kv: logical_tokens=%u physical_tokens=%d allocated_mib=%.1f growth_count=%d "
+                     "grow_restore_ms=%.1f\n",
+                     llama_n_ctx(ctx.get()), physical_kv_tokens,
+                     double(llama_get_kv_cache_size_bytes(ctx.get())) / (1024.0 * 1024.0), kv_growth_count,
+                     secs(started, clock_t_::now()) * 1000.0);
+        return true;
     }
 
     // The MTP draft source (SpecConfig::source == mtp). A SECOND context over the SAME model,
@@ -793,7 +946,19 @@ const std::string & Session::arch() const {
     return impl_->arch;
 }
 int Session::n_ctx() const {
-    return impl_->cfg.n_ctx;
+    return int(llama_n_ctx(impl_->ctx.get()));
+}
+
+int Session::physical_kv_tokens() const {
+    return impl_->physical_kv_tokens;
+}
+
+size_t Session::physical_kv_bytes() const {
+    return llama_get_kv_cache_size_bytes(impl_->ctx.get());
+}
+
+int Session::kv_growth_count() const {
+    return impl_->kv_growth_count;
 }
 int Session::n_expert_used() const {
     return impl_->n_expert_used;
@@ -1053,7 +1218,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     const int tile = cfg.layer_tile_tokens;
     if (tile != 0 && (tile != -1 && (tile < 512 || tile > 8192 || (tile & (tile - 1)) != 0) || cfg.n_ubatch != 64 ||
                       cfg.n_ctx < 512 || cfg.n_batch < 512 || (tile > 0 && tile > std::min(cfg.n_ctx, cfg.n_batch)) ||
-                      cfg.spec.enabled() || cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled))
+                      (cfg.spec.enabled() && !cfg.spec.is_mtp()) || cfg.prefill.enabled() ||
+                      cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled))
         return fail("layer-tiled prefill requires auto or a power-of-two tile from 512 to 8192 within batch/context "
                     "capacity, 64-token ubatches, MoE streaming and full CUDA placement");
     if (cfg.moe.require_release_mmap && !cfg.moe.release_mmap)
@@ -1063,15 +1229,22 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (cfg.gpu.n_gpu_layers != 0 &&
         (cfg.moe.row_stream || cfg.moe.drop_cold_frac > 0.0f || cfg.moe.substitute_lambda > 0.0f ||
          cfg.moe.route_ahead > 0 || cfg.moe.predict_log || cfg.moe.predict_prefetch || cfg.moe.prefetch_layers > 0 ||
-         cfg.decide.enabled || cfg.spec.enabled()))
+         cfg.decide.enabled || (cfg.spec.enabled() && !cfg.spec.is_mtp())))
         return fail("CUDA hybrid currently supports exact streaming without row-stream, routing policies, "
-                    "speculation, decide, or prefetch");
+                    "non-MTP speculation, decide, or prefetch");
     if ((!cfg.agent_state_cache_path.empty() || !cfg.claude_prefix_cache_path.empty()) &&
-        (cfg.spec.enabled() || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
+        ((cfg.spec.enabled() && !cfg.spec.is_mtp()) || cfg.sampling.temp > 0.0f || cfg.moe.drop_cold_frac > 0.0f ||
          cfg.moe.substitute_lambda > 0.0f || cfg.moe.route_ahead > 0))
-        return fail("agent state cache requires greedy sampling and exact, unspeculated routing");
+        return fail("agent state cache requires greedy sampling and exact, non-ngram routing");
     if (!cfg.claude_prefix_cache_path.empty() && cfg.claude_prefix_cache_path == cfg.agent_state_cache_path)
         return fail("Claude prefix cache and rolling agent state cache need different files");
+    if (cfg.gpu.elastic_kv &&
+        (cfg.n_ctx < 512 || cfg.gpu.elastic_kv_chunk_tokens < 512 || cfg.gpu.elastic_kv_chunk_tokens > 32768 ||
+         (cfg.gpu.elastic_kv_chunk_tokens & (cfg.gpu.elastic_kv_chunk_tokens - 1)) != 0 || cfg.gpu.n_gpu_layers != -1 ||
+         !cfg.gpu.kv_offload || !cfg.moe.enabled || (cfg.spec.enabled() && !cfg.spec.is_mtp()) ||
+         cfg.prefill.enabled() || cfg.decide.enabled))
+        return fail("elastic KV needs a 512+ context, 512-32768 power-of-two chunk, full CUDA MoE streaming, "
+                    "GPU KV, and no non-MTP speculation, prefill device, or decide");
 
     // Create the session first so its Impl destructor owns backend teardown from this point
     // on: any failure below returns nullptr, destroying `self`, which frees the backend once.
@@ -1080,11 +1253,13 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     im.cfg = cfg;
     if (!cfg.agent_state_cache_path.empty()) {
         im.agent_cache.path = cfg.agent_state_cache_path;
+        im.agent_cache.with_draft = cfg.spec.is_mtp();
         im.agent_cache.key = agent_state_key(cfg);
         if (im.agent_cache.key == 0) return fail("agent state cache cannot identify the model file");
     }
     if (!cfg.claude_prefix_cache_path.empty()) {
         im.claude_cache.path = cfg.claude_prefix_cache_path;
+        im.claude_cache.with_draft = cfg.spec.is_mtp();
         const uint64_t model_key = agent_state_key(cfg);
         if (model_key == 0) return fail("Claude prefix cache cannot identify the model file");
         constexpr char format[] = "claude-bridge-prefix-v2|chat-template-v1";
@@ -1218,6 +1393,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     im.arch = arch;
 
     const MoeRecipe * recipe = nullptr;
+    if (cfg.gpu.elastic_kv && im.arch != "qwen35moe")
+        return fail("elastic KV currently supports qwen35moe hybrid attention only");
     if (cfg.moe.enabled) {
         recipe = find_moe_recipe(arch);
         if (!recipe)
@@ -1281,6 +1458,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         break;
     }
     cparams.n_ctx = cfg.n_ctx;
+    cparams.n_kv = cfg.gpu.elastic_kv ? uint32_t(std::min(cfg.n_ctx, cfg.gpu.elastic_kv_chunk_tokens)) : 0;
     cparams.n_batch = cfg.n_batch;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
     // buffers — the memory this engine is always short of. 0 keeps the historical behaviour
@@ -1305,9 +1483,15 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // the sequence, which would hand back exactly the decode the speculation just saved.
     if (cfg.spec.enabled()) cparams.n_rs_seq = (uint32_t) cfg.spec.draft_max;
 
+    im.context_params = cparams;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) return fail("failed to create context");
     im.ctx.reset(ctx);
+    im.physical_kv_tokens = int(llama_get_kv_cache_capacity(ctx));
+    if (cfg.gpu.elastic_kv)
+        std::fprintf(
+            stderr, "bmoe-elastic-kv: logical_tokens=%u physical_tokens=%d allocated_mib=%.1f growth_count=0\n",
+            llama_n_ctx(ctx), im.physical_kv_tokens, double(llama_get_kv_cache_size_bytes(ctx)) / (1024.0 * 1024.0));
 #ifdef _WIN32
     std::fprintf(stderr, "bmoe-kv-cache: K=%s V=%s\n", ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v));
 #endif
@@ -1319,6 +1503,8 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (cfg.spec.is_mtp()) {
         llama_context_params dparams = cparams;
         dparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        dparams.ctx_other = ctx;
+        dparams.ctx_other_share_compute = true;
         dparams.n_rs_seq = 0;
         // Compute buffers are reserved for the WIDEST ubatch, and left at the target's width the
         // draft context reserves gigabytes for a graph it never runs: the widest thing it ever
@@ -1366,19 +1552,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     // extraction for both contexts, which is what the target graph looks like for the rest of the
     // session. Capturing the graph it actually runs beats capturing the one it briefly had.
     if (cfg.spec.is_mtp()) {
-        common_params_speculative sp;
-        sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
-        sp.draft.n_max = cfg.spec.draft_max;
-        sp.draft.n_min = 0; // never skip a whole draft; width is bounded by n_max and p_min below
-        // The head's own confidence floor for continuing to draft. At 0 (the default) it drafts
-        // n_max tokens however unsure it is, which is what the host was measured at; above 0 the
-        // width becomes adaptive per step. See SpecConfig::draft_p_min for why that pays twice on a
-        // streamed device.
-        sp.draft.p_min = cfg.spec.draft_p_min;
-        sp.draft.ctx_tgt = ctx; // self-speculation: one model, two contexts over it
-        sp.draft.ctx_dft = im.ctx_dft.get();
-        im.mtp.reset(common_speculative_init(sp, /*n_seq*/ 1));
-        if (!im.mtp) return fail("failed to initialise MTP speculative decoding");
+        if (!im.init_mtp_driver()) return fail("failed to initialise MTP speculative decoding");
     }
 
     // The wide verify batch belongs to the loop, not to a source: whoever drafted, the target is
@@ -1401,6 +1575,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         if (cfg.spec.is_mtp()) {
             batch_fill(im.mtp_batch, &warm_tok, 1, /*pos0*/ 0, /*all_logits*/ true);
             if (im.decode_target(ctx, im.mtp_batch) != 0) return fail("capture warm-up decode failed");
+            llama_synchronize(ctx);
             // The MTP graph is built only by a decode on the draft context, and process() is what
             // issues it. Without this pass the head's expert layer never reaches the eval callback,
             // so it would stay unbound and silently mmap-resident — the one thing streaming exists
@@ -1469,11 +1644,15 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             // one entry's alias list so the bytes are still read and allocated exactly once.
             std::vector<DenseTensorRef> dense, rows;
             std::unordered_map<uint64_t, size_t> dense_at; // (shard, file offset) -> index in `dense`
+            std::unordered_set<std::string> device_owned;
             for (ggml_tensor * t : im.hook->captured_weight_objects()) {
                 if (!t) continue;
                 // Device-owned dense weights have already been uploaded by llama.cpp. Rebinding
                 // their data pointer to host anon memory would invalidate their CUDA buffer.
-                if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) continue;
+                if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                    device_owned.insert(t->name);
+                    continue;
+                }
                 const std::string name = t->name;
                 if (expert_names.count(name)) continue;
                 auto off = offs.off_by_name.find(name);
@@ -1512,6 +1691,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                 owned.reserve(dense.size());
                 for (const DenseTensorRef & d : dense)
                     if (d.tensor) owned.insert(d.tensor->name);
+                owned.insert(device_owned.begin(), device_owned.end());
                 for (const auto & kv : offs.off_by_name)
                     if (!expert_names.count(kv.first) && !owned.count(kv.first)) unaccounted.push_back(kv.first);
             }
@@ -1522,7 +1702,12 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
 
         if (cfg.gpu.expert_cache_mb > 0) {
             std::string pool_error;
-            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, layers, pool_error,
+            // The fixed GPU pool serves trunk experts; the extra MTP block still uses the RAM streamer.
+            std::vector<LayerExperts> gpu_cache_layers = layers;
+            if (cfg.spec.is_mtp())
+                for (size_t il = size_t(im.n_layer); il < gpu_cache_layers.size(); ++il)
+                    gpu_cache_layers[il].bound = false;
+            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, gpu_cache_layers, pool_error,
                                      cfg.gpu.safety_mb))
                 return fail("GPU expert cache: " + pool_error);
             im.gpu_recent_miss.assign(layers.size() * size_t(n_expert), 0);
@@ -1534,7 +1719,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             if (!im.gpu_expert_metadata) return fail("GPU expert cache metadata allocation failed");
             im.gpu_expert_layers.resize(layers.size());
             for (size_t il = 0; il < layers.size(); ++il) {
-                if (!layers[il].bound) continue;
+                if (!gpu_cache_layers[il].bound) continue;
                 auto & descriptor = im.gpu_expert_layers[il];
                 descriptor.gate = im.gpu_experts.make_weight_tensor(im.gpu_expert_metadata.get(), int(il), 0);
                 descriptor.up = im.gpu_experts.make_weight_tensor(im.gpu_expert_metadata.get(), int(il), 1);
@@ -1843,6 +2028,8 @@ RunResult Session::generate(const GenerateRequest & req,
         return res;
     };
 
+    if (!ctx) return fail("session context unavailable after KV growth failure");
+
     // clear_kv = "new chat": drop the KV and the engine-held conversation. Otherwise this turn
     // continues the conversation, reusing the KV prefix already decoded from earlier turns.
     if (req.clear_kv) {
@@ -1914,7 +2101,6 @@ RunResult Session::generate(const GenerateRequest & req,
     if (n_prompt + req.n_predict + 8 > im.cfg.n_ctx)
         return fail("prompt + n_predict exceeds the session n_ctx (" + std::to_string(im.cfg.n_ctx) +
                     "); open the session with a larger n_ctx");
-
     // The bridge marks only text preceding Claude's conversation. Tokenize it through the same
     // chat template and retain only the exact common token prefix; BPE may merge at its edge.
     size_t claude_checkpoint = 0;
@@ -2022,8 +2208,10 @@ RunResult Session::generate(const GenerateRequest & req,
         for (AgentStateCache * candidate : {first, second}) {
             if (req.claude_prewarm && candidate == &im.agent_cache) continue;
             if (!candidate->match_count(tokens)) continue;
-            const size_t restored = candidate->restore(ctx, tokens);
-            if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1)) {
+            const size_t restored = candidate->restore(ctx, im.ctx_dft.get(), tokens);
+            if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1) &&
+                (!im.ctx_dft || llama_memory_seq_pos_max(llama_get_memory(im.ctx_dft.get()), 0) ==
+                                    llama_pos(restored - 1))) {
                 n_common = restored;
                 if (chat_on) im.kv_tokens = candidate->tokens;
                 std::fprintf(stderr, "bmoe: %s cache hit: %zu tokens, suffix %zu tokens, %.1f MiB, restore %.3f s\n",
@@ -2033,7 +2221,9 @@ RunResult Session::generate(const GenerateRequest & req,
                 break;
             }
             im.clear_memory(ctx);
+            if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
             candidate->state.clear();
+            candidate->draft_state.clear();
             candidate->tokens.clear();
             std::fprintf(stderr, "bmoe: %s cache rejected invalid restored state; trying next exact prefix\n",
                          candidate == &im.claude_cache ? "Claude prefix" : "rolling agent state");
@@ -2157,6 +2347,11 @@ RunResult Session::generate(const GenerateRequest & req,
         int chunk = std::min(pf_step, n_prompt - i);
         if (checkpoint > size_t(i) && checkpoint < size_t(i + chunk)) chunk = int(checkpoint) - i;
         if (claude_checkpoint > size_t(i) && claude_checkpoint < size_t(i + chunk)) chunk = int(claude_checkpoint) - i;
+        if (im.cfg.gpu.elastic_kv) {
+            std::string growth_error;
+            if (!im.ensure_kv_capacity(i + chunk, growth_error)) return fail(growth_error);
+            ctx = im.ctx.get();
+        }
         if (im.prefill) {
             const bool on_dev = chunk >= im.cfg.prefill.min_tokens;
             im.place_prefill(on_dev);
@@ -2185,18 +2380,19 @@ RunResult Session::generate(const GenerateRequest & req,
         trace_flush();
         // The draft context has to walk the prompt too: its KV must reach the last prompt position
         // or the first draft is made from a hidden state that never saw the prompt.
+        if (mtp_on) llama_synchronize(ctx);
         if (mtp_on && !common_speculative_process(im.mtp.get(), pf))
             return fail("MTP draft context failed to process the prefill batch");
         i += chunk;
         if (checkpoint != 0 && size_t(i) == checkpoint) {
             const auto t_capture = clock_t_::now();
-            if (im.agent_cache.capture(ctx, tokens, checkpoint))
+            if (im.agent_cache.capture(ctx, im.ctx_dft.get(), tokens, checkpoint))
                 std::fprintf(stderr, "bmoe: agent state cache checkpoint: %zu tokens, %.1f MiB, capture %.3f s\n",
                              checkpoint, double(im.agent_cache.state.size()) / (1024.0 * 1024.0),
                              secs(t_capture, clock_t_::now()));
         }
         if (claude_checkpoint != 0 && size_t(i) == claude_checkpoint &&
-            im.claude_cache.capture(ctx, tokens, claude_checkpoint))
+            im.claude_cache.capture(ctx, im.ctx_dft.get(), tokens, claude_checkpoint))
             std::fprintf(stderr, "bmoe: Claude prefix cache checkpoint: %zu tokens, suffix %zu tokens, %.1f MiB\n",
                          claude_checkpoint, tokens.size() - claude_checkpoint,
                          double(im.claude_cache.state.size()) / (1024.0 * 1024.0));
@@ -2290,6 +2486,16 @@ RunResult Session::generate(const GenerateRequest & req,
     while (n_gen < req.n_predict) {
         if (llama_vocab_is_eog(im.vocab, tok)) break;
 
+        if (im.cfg.gpu.elastic_kv) {
+            const int remaining_draft = spec_on ? std::min(im.cfg.spec.draft_max, req.n_predict - n_gen - 1) : 0;
+            const int growth_before = im.kv_growth_count;
+            std::string growth_error;
+            if (!im.ensure_kv_capacity(n_past + 1 + remaining_draft, growth_error)) return fail(growth_error);
+            ctx = im.ctx.get();
+            if (mtp_on && im.kv_growth_count != growth_before)
+                common_speculative_begin(im.mtp.get(), /*seq_id*/ 0, mtp_ctx);
+        }
+
         // ── draft ──
         // The source proposes a continuation of `tok`, capped at the caller's remaining budget: a
         // draft accepted past n_predict would be verified, charged for, and then discarded. The cap
@@ -2302,6 +2508,7 @@ RunResult Session::generate(const GenerateRequest & req,
             const uint64_t db0 = moe.enabled ? im.source.stats().read_bytes : 0;
             im.draft_buf.clear();
             if (mtp_on) {
+                llama_synchronize(ctx);
                 common_speculative_draft_params & dp = common_speculative_get_draft_params(im.mtp.get(), /*seq*/ 0);
                 dp.drafting = true;
                 dp.n_max = std::min(im.cfg.spec.draft_max, room);
@@ -2425,6 +2632,7 @@ RunResult Session::generate(const GenerateRequest & req,
             if (mtp_on) {
                 const auto p0 = clock_t_::now();
                 const uint64_t pb0 = moe.enabled ? im.source.stats().read_bytes : 0;
+                llama_synchronize(ctx);
                 batch_fill(im.mtp_batch, verify_toks.data(), 1 + n_acc, n_past, /*all_logits*/ false);
                 if (!common_speculative_process(im.mtp.get(), im.mtp_batch))
                     return fail("MTP draft context failed to process the verify batch");

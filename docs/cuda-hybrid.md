@@ -28,6 +28,34 @@ build-cuda/cli/Release/bmoe-cli.exe -m model.gguf -p 'The capital of Japan is' -
 
 The Windows CLI accepts `--cache-type-k f16|q8_0|q4_0` and `--cache-type-v f16|q8_0|q4_0` independently. Both default to `f16` when omitted; they select llama.cpp's existing KV cache storage types without changing model weights. The `bmoe-kv-cache: K=... V=...` startup line reports the types passed to the successfully created context. llama.cpp checks whether the chosen types work with the model and attention mode; in particular, a quantized V cache may require Flash Attention.
 
+`--elastic-kv` is an opt-in physical attention-KV allocation for the Windows
+`qwen35moe` hybrid CUDA path. It keeps the requested logical context (including
+262,144 tokens) in llama.cpp while starting with at most 32,768 physical KV
+cells. The cache grows in 32,768-token chunks when a request needs more cells.
+Growth saves the exact hybrid sequence state, recreates only `llama_context`
+over the loaded model, restores the state, and rebuilds its graphs. Startup and
+growth diagnostics print logical and physical tokens, allocated KV MiB, growth
+count, and elapsed growth/restore time. Native embedded MTP recreates its draft
+context against the new target and reattaches shared compute backing during
+growth. The option requires full CUDA MoE streaming with GPU KV and excludes
+non-MTP speculation, a separate prefill device, and decide mode. The GPU expert
+pool retains its configured fixed budget.
+
+With Q4_0 K/V on the Qwen3.6-35B-A3B model, a 262,144-token logical context
+reserved 180 MiB of physical KV at startup with `--elastic-kv`, versus 1,440
+MiB without it. A 128-token greedy screen produced identical text with the
+fixed 1,500 MiB GPU expert pool. A real-model Claude prefix restart restored
+576 tokens, evaluated 10 prompt tokens versus 586 cold, and produced the same
+eight greedy tokens. A trial that reassigned saved KV VRAM to a
+larger expert pool changed a later greedy token, so dynamic expert-pool sharing
+is not offered as a runtime option. With native embedded MTP and the fixed
+1,500 MiB / 848-slot expert pool, a real Qwen3.6 continuation crossed the
+32,768-cell boundary and grew physical KV to 65,536 cells in 486.4 ms. The
+same 32-token continuation from one saved 32,256-token hybrid prefix matched
+byte for byte after growth and after restoring that prefix into the already
+grown context. Logical context remained 262,144, GPU safety remained 128 MiB,
+and mapping release stayed active.
+
 For the Qwen3.5 MoE hybrid model, `--prefill-layer-tile N|auto` enables an
 experimental layer-major prompt schedule. Manual `N` is a power of two from
 512 through 8192 and cannot exceed the context or session batch capacity.
@@ -37,7 +65,9 @@ for the F32 activation plane; unknown memory
 falls back to 512. A continued session chooses again for its new prompt suffix.
 The physical CUDA graphs and quantized FlashAttention remain width 64. It
 requires `--ubatch 64 --moe-stream --n-gpu-layers -1`, a context of at least
-512 tokens, and no speculation or prefill device. It is off by default and
+512 tokens, and no non-MTP speculation or prefill device. Native MTP preserves
+its per-token NextN output and recurrent rollback state through tiled prefill.
+It is off by default and
 does not change one-token decode. At hidden width 2,048 the reusable host
 activation plane is 4 MiB at 512 and 64 MiB at 8192. Runtime diagnostics
 report the selected tile and plane size. If tiled execution fails after state
