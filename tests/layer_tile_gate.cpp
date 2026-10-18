@@ -120,8 +120,51 @@ static bool check_case(llama_model * model, int n_tokens, int tile_tokens = 512)
     return true;
 }
 
+static bool mid_prompt_checkpoint_gate(const char * path, const llama_model * model) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    auto count_tokens = [&](const std::string & prompt) {
+        return -llama_tokenize(vocab, prompt.c_str(), int(prompt.size()), nullptr, 0, true, true);
+    };
+    std::string original;
+    size_t insertion = 0;
+    for (int i = 0; count_tokens(original) < 5000; ++i) {
+        original += " item " + std::to_string(i) + ".";
+        if (!insertion && count_tokens(original) > 4200) insertion = original.size();
+    }
+    std::string changed = original;
+    changed.insert(insertion, " inserted request detail.");
+    const std::string cache = std::string(path) + ".mid-prompt-gate";
+    std::error_code ec;
+    std::filesystem::remove(cache, ec);
+    bmoe::RunConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 8192;
+    cfg.n_predict = 2;
+    cfg.agent_state_cache_path = cache;
+    std::string error;
+    auto warm_session = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+    bmoe::GenerateRequest req;
+    req.prompt = original;
+    req.n_predict = 2;
+    const bmoe::RunResult first = warm_session ? warm_session->generate(req) : bmoe::RunResult{};
+    req.prompt = changed;
+    const bmoe::RunResult reused = warm_session ? warm_session->generate(req) : bmoe::RunResult{};
+    warm_session.reset();
+    std::filesystem::remove(cache, ec);
+    auto cold_session = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+    const bmoe::RunResult cold = cold_session ? cold_session->generate(req) : bmoe::RunResult{};
+    cold_session.reset();
+    std::filesystem::remove(cache, ec);
+    const bool ok = first && reused && cold && reused.summary.n_prompt == cold.summary.n_prompt - 4096 &&
+                    reused.generated_text == cold.generated_text;
+    if (!ok)
+        std::fprintf(stderr, "mid-prompt checkpoint failed: %s; prefill=%d/%d, output_equal=%d\n", error.c_str(),
+                     reused.summary.n_prompt, cold.summary.n_prompt, reused.generated_text == cold.generated_text);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
     llama_backend_init();
     bool gpu_available = false;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i)
@@ -131,6 +174,13 @@ int main(int argc, char ** argv) {
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1], params),
                                                                     llama_model_free);
     if (!model) return 1;
+    if (argc == 3) {
+        const bool ok =
+            std::strcmp(argv[2], "--mid-prompt-only") == 0 && mid_prompt_checkpoint_gate(argv[1], model.get());
+        model.reset();
+        llama_backend_free();
+        return ok ? 0 : 1;
+    }
     bool ok = check_case(model.get(), 1) && check_case(model.get(), 64) && check_case(model.get(), 65) &&
               check_case(model.get(), 130) && check_case(model.get(), 520) && check_case(model.get(), 520, 1024) &&
               check_case(model.get(), 900, 1024) && check_case(model.get(), 900, 8192);

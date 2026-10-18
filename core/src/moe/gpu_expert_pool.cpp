@@ -25,7 +25,8 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
                          int n_expert,
                          const std::vector<LayerExperts> & experts,
                          std::string & error,
-                         int safety_mb) {
+                         int safety_mb,
+                         bool enable_device_owned) {
     reset();
     if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU || budget_mb <= 0 || n_expert <= 0) {
         error = "GPU expert pool needs a GPU device, a positive budget, and expert metadata";
@@ -43,7 +44,9 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
     const size_t alignment = std::max<size_t>(128, ggml_backend_buft_get_alignment(buft));
     alignment_ = alignment;
     n_expert_ = n_expert;
-    map_stride_ = aligned(size_t(n_expert) * sizeof(int32_t), alignment);
+    map_stride_ = aligned(size_t(n_expert) * size_t(map_batch_max_) * sizeof(int32_t), alignment);
+    state_stride_ = aligned((size_t(n_expert) + 2 * size_t(n_expert + 1) + 3) * sizeof(int32_t), alignment);
+    map_upload_.resize(size_t(n_expert) * size_t(map_batch_max_));
     const size_t budget = size_t(budget_mb) * mib;
     layers_.resize(experts.size());
     slots_.resize(experts.size());
@@ -69,13 +72,13 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
             return false;
         }
         // Slot zero is the dummy. A real slot is also required to make this a cache.
-        if (minimum > budget || map_stride_ > budget - minimum ||
-            layers_[il].bundle_bytes > (budget - minimum - map_stride_) / 2) {
+        if (minimum > budget || map_stride_ + state_stride_ > budget - minimum ||
+            layers_[il].bundle_bytes > (budget - minimum - map_stride_ - state_stride_) / 2) {
             error = "GPU expert budget cannot hold a dummy and one real slot per layer";
             reset();
             return false;
         }
-        minimum += map_stride_ + 2 * layers_[il].bundle_bytes;
+        minimum += map_stride_ + state_stride_ + 2 * layers_[il].bundle_bytes;
         layers_[il].slot_count = 2;
     }
     if (!minimum) {
@@ -83,6 +86,7 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
         reset();
         return false;
     }
+    minimum_bytes_ = minimum;
     size_t used = minimum;
     bool grew = true;
     while (grew) {
@@ -107,6 +111,8 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
         }
         layer.device_map_offset = aligned(offset, alignment);
         offset = layer.device_map_offset + map_stride_;
+        layer.device_state_offset = aligned(offset, alignment);
+        offset = layer.device_state_offset + state_stride_;
     }
     if (offset > budget) {
         error = "GPU expert slot layout exceeds its budget";
@@ -158,6 +164,40 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
         reset();
         return false;
     }
+    auto * reg = ggml_backend_dev_backend_reg(device);
+    using mapped_pointer_fn = void * (*) (ggml_backend_dev_t, void *);
+    using mapped_alloc_fn = ggml_backend_buffer_t (*)(size_t);
+    auto mapped_pointer = reg ? reinterpret_cast<mapped_pointer_fn>(
+                                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_host_pointer"))
+                              : nullptr;
+    auto mapped_alloc = reg ? reinterpret_cast<mapped_alloc_fn>(
+                                  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_alloc_mapped_host_buffer"))
+                            : nullptr;
+    if (enable_device_owned && mapped_pointer && mapped_alloc) {
+        stage_request_stride_ = aligned((2 * size_t(n_expert_ + 1) + 1) * sizeof(int32_t), alignment);
+        size_t stage_bytes = stage_request_stride_ * layers_.size();
+        size_t max_slots = 0;
+        for (const Layer & layer : layers_)
+            max_slots = std::max(max_slots, size_t(layer.slot_count));
+        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+            size_t max_bytes = 0;
+            for (const Layer & layer : layers_)
+                if (layer.slot_count) max_bytes = std::max(max_bytes, layer.proj[p].expert_bytes);
+            stage_projection_stride_[p] = aligned(max_bytes, alignment);
+            stage_projection_offset_[p] = stage_bytes;
+            stage_bytes += stage_projection_stride_[p] * max_slots;
+        }
+        host_stage_ = mapped_alloc(stage_bytes);
+        if (host_stage_) {
+            stage_host_base_ = static_cast<char *>(ggml_backend_buffer_get_base(host_stage_));
+            stage_device_base_ = static_cast<char *>(mapped_pointer(device, stage_host_base_));
+        }
+        if (!stage_device_base_) {
+            if (host_stage_) ggml_backend_buffer_free(host_stage_);
+            host_stage_ = nullptr;
+            stage_host_base_ = nullptr;
+        }
+    }
     planned_bytes_ = offset;
     for (const Layer & layer : layers_)
         capacity_ += size_t(std::max(0, layer.slot_count - 1));
@@ -175,19 +215,28 @@ bool GpuExpertPool::init(ggml_backend_dev_t device,
             reset();
             return false;
         }
+        reset_device_state(int(il));
     }
     return true;
 }
 
 void GpuExpertPool::reset() {
     std::lock_guard<std::mutex> lock(mu_);
+    if (host_stage_) ggml_backend_buffer_free(host_stage_);
+    host_stage_ = nullptr;
+    stage_host_base_ = stage_device_base_ = nullptr;
+    stage_request_stride_ = 0;
+    std::fill_n(stage_projection_offset_, MoeRecipe::max_exps, 0);
+    std::fill_n(stage_projection_stride_, MoeRecipe::max_exps, 0);
     if (host_maps_) ggml_backend_buffer_free(host_maps_);
     host_maps_ = nullptr;
     if (buffer_) ggml_backend_buffer_free(buffer_);
     buffer_ = nullptr;
-    allocated_bytes_ = planned_bytes_ = capacity_ = 0;
+    allocated_bytes_ = minimum_bytes_ = planned_bytes_ = capacity_ = 0;
     alignment_ = 1;
     map_stride_ = 0;
+    state_stride_ = 0;
+    map_upload_.clear();
     n_expert_ = 0;
     clock_ = 0;
     evictions_ = 0;
@@ -215,9 +264,26 @@ ggml_tensor GpuExpertPool::projection_tensor(int layer, int slot, int projection
     return tensor;
 }
 
+void GpuExpertPool::reset_device_state(int layer) {
+    const Layer & layout = layers_[size_t(layer)];
+    std::vector<int32_t> state(size_t(n_expert_) + 2 * size_t(layout.slot_count) + 3, 0);
+    std::fill(state.begin(), state.begin() + n_expert_ + layout.slot_count, -1);
+    state[size_t(n_expert_) + 2 * size_t(layout.slot_count)] = 1;
+    ggml_tensor bytes{};
+    bytes.type = GGML_TYPE_I8;
+    bytes.ne[0] = int64_t(state.size() * sizeof(int32_t));
+    bytes.ne[1] = bytes.ne[2] = bytes.ne[3] = 1;
+    bytes.nb[0] = 1;
+    bytes.nb[1] = bytes.nb[2] = bytes.nb[3] = size_t(bytes.ne[0]);
+    bytes.buffer = buffer_;
+    bytes.data = static_cast<char *>(ggml_backend_buffer_get_base(buffer_)) + layout.device_state_offset;
+    ggml_backend_tensor_set(&bytes, state.data(), 0, state.size() * sizeof(int32_t));
+}
+
 void GpuExpertPool::clear_residency() {
     std::lock_guard<std::mutex> lock(mu_);
-    for (auto & layer : slots_)
+    for (size_t il = 0; il < slots_.size(); ++il) {
+        auto & layer = slots_[il];
         for (size_t i = 1; i < layer.size(); ++i) {
             Slot & slot = layer[i];
             slot.state = State::Empty;
@@ -227,6 +293,8 @@ void GpuExpertPool::clear_residency() {
             slot.pins = 0;
             slot.uploaded_mask = 0;
         }
+        if (!layer.empty()) reset_device_state(int(il));
+    }
 }
 
 GpuExpertPool::Lease GpuExpertPool::reserve(int layer, int expert) {
@@ -312,7 +380,7 @@ ggml_tensor * GpuExpertPool::make_device_table(ggml_context * ctx, int layer) co
     std::lock_guard<std::mutex> lock(mu_);
     if (!ctx || !buffer_ || layer < 0 || size_t(layer) >= layers_.size() || !layers_[size_t(layer)].slot_count)
         return nullptr;
-    ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert_);
+    ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, n_expert_, map_batch_max_);
     if (!table) return nullptr;
     table->buffer = buffer_;
     table->data = static_cast<char *>(ggml_backend_buffer_get_base(buffer_)) + layers_[size_t(layer)].device_map_offset;
@@ -329,6 +397,78 @@ ggml_tensor * GpuExpertPool::make_host_table(ggml_context * ctx, int layer) cons
     table->data =
         static_cast<char *>(ggml_backend_buffer_get_base(host_maps_)) + layers_[size_t(layer)].host_map_offset;
     return table;
+}
+
+ggml_tensor * GpuExpertPool::make_device_state(ggml_context * ctx, int layer) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!ctx || !buffer_ || layer < 0 || size_t(layer) >= layers_.size() || !layers_[size_t(layer)].slot_count)
+        return nullptr;
+    const Layer & layout = layers_[size_t(layer)];
+    ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_expert_ + 2 * layout.slot_count + 3);
+    if (!state) return nullptr;
+    state->buffer = buffer_;
+    state->data = static_cast<char *>(ggml_backend_buffer_get_base(buffer_)) + layout.device_state_offset;
+    return state;
+}
+
+ggml_tensor * GpuExpertPool::make_host_stage_tensor(ggml_context * ctx, int layer, int projection) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!ctx || !host_stage_ || layer < 0 || size_t(layer) >= layers_.size() || projection < 0 ||
+        projection >= MoeRecipe::max_exps)
+        return nullptr;
+    const Projection & proj = layers_[size_t(layer)].proj[projection];
+    if (!proj.shape || !stage_projection_stride_[projection] ||
+        stage_projection_stride_[projection] < proj.expert_bytes)
+        return nullptr;
+    const ggml_tensor * src = proj.shape;
+    ggml_tensor * tensor =
+        ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], layers_[size_t(layer)].slot_count);
+    if (!tensor) return nullptr;
+    tensor->nb[2] = stage_projection_stride_[projection];
+    tensor->nb[3] = tensor->nb[2] * size_t(layers_[size_t(layer)].slot_count);
+    tensor->data = stage_device_base_ + stage_projection_offset_[projection];
+    return tensor;
+}
+
+int32_t * GpuExpertPool::host_fill_list(int layer) const {
+    if (!host_stage_ || layer < 0 || size_t(layer) >= layers_.size() || !layers_[size_t(layer)].slot_count)
+        return nullptr;
+    return reinterpret_cast<int32_t *>(stage_host_base_ + size_t(layer) * stage_request_stride_);
+}
+
+bool GpuExpertPool::stage_projection(int layer, int fill_index, int projection, const void * bytes, size_t size) {
+    if (!host_stage_ || !bytes || layer < 0 || size_t(layer) >= layers_.size() || fill_index < 0 ||
+        fill_index >= layers_[size_t(layer)].slot_count || projection < 0 || projection >= MoeRecipe::max_exps ||
+        size != layers_[size_t(layer)].proj[projection].expert_bytes || size > stage_projection_stride_[projection])
+        return false;
+    std::memcpy(stage_host_base_ + stage_projection_offset_[projection] +
+                    size_t(fill_index) * stage_projection_stride_[projection],
+                bytes, size);
+    return true;
+}
+
+GpuExpertPool::DeviceStats GpuExpertPool::device_stats() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    DeviceStats stats;
+    if (!buffer_) return stats;
+    for (const Layer & layer : layers_) {
+        if (!layer.slot_count) continue;
+        const size_t offset =
+            layer.device_state_offset + (size_t(n_expert_) + 2 * size_t(layer.slot_count) + 1) * sizeof(int32_t);
+        ggml_tensor counters{};
+        counters.type = GGML_TYPE_I32;
+        counters.ne[0] = 2;
+        counters.ne[1] = counters.ne[2] = counters.ne[3] = 1;
+        counters.nb[0] = sizeof(int32_t);
+        counters.nb[1] = counters.nb[2] = counters.nb[3] = 2 * sizeof(int32_t);
+        counters.buffer = buffer_;
+        counters.data = static_cast<char *>(ggml_backend_buffer_get_base(buffer_)) + offset;
+        int32_t values[2]{};
+        ggml_backend_tensor_get(&counters, values, 0, sizeof(values));
+        stats.routed += uint32_t(values[0]);
+        stats.fills += uint32_t(values[1]);
+    }
+    return stats;
 }
 
 bool GpuExpertPool::update_mapping(int layer, const int32_t * slots, int count) {
@@ -350,14 +490,17 @@ bool GpuExpertPool::update_mapping(int layer, const int32_t * slots, int count) 
     std::memcpy(host, slots, bytes);
     ggml_tensor device_bytes{};
     device_bytes.type = GGML_TYPE_I8;
-    device_bytes.ne[0] = int64_t(bytes);
+    for (int token = 0; token < map_batch_max_; ++token)
+        std::memcpy(map_upload_.data() + size_t(token) * size_t(count), slots, bytes);
+    const size_t device_bytes_count = bytes * size_t(map_batch_max_);
+    device_bytes.ne[0] = int64_t(device_bytes_count);
     device_bytes.ne[1] = device_bytes.ne[2] = device_bytes.ne[3] = 1;
     device_bytes.nb[0] = 1;
-    device_bytes.nb[1] = device_bytes.nb[2] = device_bytes.nb[3] = bytes;
+    device_bytes.nb[1] = device_bytes.nb[2] = device_bytes.nb[3] = device_bytes_count;
     device_bytes.buffer = buffer_;
     device_bytes.data =
         static_cast<char *>(ggml_backend_buffer_get_base(buffer_)) + layers_[size_t(layer)].device_map_offset;
-    ggml_backend_tensor_set(&device_bytes, slots, 0, bytes);
+    ggml_backend_tensor_set(&device_bytes, map_upload_.data(), 0, device_bytes_count);
     return true;
 }
 
@@ -394,6 +537,16 @@ GpuExpertPool::Lease GpuExpertPool::pin(int layer, int expert) {
         }
     }
     return {};
+}
+
+int GpuExpertPool::available_slots(int layer) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (layer < 0 || size_t(layer) >= slots_.size()) return 0;
+    int count = 0;
+    const auto & slots = slots_[size_t(layer)];
+    for (size_t i = 1; i < slots.size(); ++i)
+        if (slots[i].state == State::Empty || (slots[i].state == State::Ready && !slots[i].pins)) ++count;
+    return count;
 }
 
 bool GpuExpertPool::unpin(Lease lease) {

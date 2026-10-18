@@ -7,8 +7,8 @@ the first tokens miss often and read far more from flash than the steady state �
 
 Session mode amortises both. `Session` (`core/include/bmoe/session.h`) loads the model, discovers
 the MoE expert tensors, and initialises the expert source **once**; each `generate()` then runs a
-prompt against that resident state, and the expert LRU cache **survives between calls**, so a
-second prompt starts warm.
+prompt against that resident state, and the expert LRU cache normally **survives between calls**,
+so a second prompt starts warm unless a GPU cache resize resets its residency.
 
 ```cpp
 std::string err;
@@ -24,11 +24,17 @@ warming the cache changes latency, never the bytes.
 
 ## Independent prompts vs multi-turn chat
 
+Session JSON generation also accepts structured `messages`, `tools`, and `tool_choice`
+with `--chatml`. These replace the single `prompt` for that request, use the GGUF chat
+template, and return parsed assistant tool calls in `BMOE_DONE`. A client can send the
+assistant call and matching tool result back as chat messages for the next turn.
+
 `GenerateRequest::clear_kv` selects between two modes:
 
 - **`true` (new chat / independent prompt):** the KV cache and the engine-held conversation are
-  dropped before the prompt runs. The expert cache stays warm. This is the one-shot path — `run()`
-  always uses it, and the byte-identity gates exercise it.
+  dropped before the prompt runs. The expert cache normally stays warm; a GPU cache resize resets
+  its residency. This is the one-shot path — `run()` always uses it, and the byte-identity gates
+  exercise it.
 - **`false` (continue):** the prompt continues the current conversation. In chat mode the Session
   owns the conversation (`chat_history`) and re-renders the model's chat template over the *whole*
   history each turn, so the caller sends only the new user message — not the running transcript.
@@ -49,6 +55,11 @@ the normal cold path. This complements live chat continuation. The persistent ch
 consulted only for `clear_kv=true`. With a GPU expert pool, dynamic expert promotion must be
 committed between decode tokens; each independent request starts with empty logical GPU residency
 and fresh graph discovery. See [agent-state-cache.md](agent-state-cache.md).
+
+The session also keeps one in-memory checkpoint at token 4096 for longer fresh prompts.
+If a later request changes after that point but before the rolling checkpoint, it restores
+the earlier exact state and evaluates the remaining suffix. With MTP, both checkpoints
+include the target sequence, draft sequence, and the draft driver's carried hidden row.
 
 **Fallbacks and costs.** SWA-style memory (e.g. Gemma) can refuse a partial `seq_rm`; the engine
 then clears the KV and re-prefills the whole prompt for that turn (correct, just slower). With
@@ -78,6 +89,19 @@ Cancel is distinct from a fatal streaming error, which is sticky and ends the se
 `n_ctx` and `n_batch` are baked into the llama context at `open()`, before any prompt is known, so
 size them for the longest prompt + generation the session will serve. A request that would overflow
 `n_ctx` is rejected without tearing the session down.
+
+With Elastic KV enabled, `n_ctx` remains the logical limit while the physical KV allocation changes
+in configured chunks. If KV growth needs dedicated VRAM, the session drains expert uploads, saves
+the target and MTP draft sequence state plus the MTP driver's carried hidden row, and shrinks the GPU
+expert pool before continuing. The pool
+keeps its per-layer dummy and real slots; if even that minimum cannot fit above the configured
+safety rail, growth fails and the prior sequence is restored. A later request whose prompt and
+requested output fit at least two chunks below the current physical capacity can shrink KV at the
+request boundary. The released memory can regrow the expert pool toward its original budget.
+Context and pool changes do not reload the model or restart the session. CUDA allocation rounding
+is checked against the dedicated-VRAM safety rail after allocation, with 64 MiB reserved for later
+graph allocations. `physical_kv_tokens()` and
+`gpu_expert_cache_bytes()` report the current allocations.
 
 ## CLI and app
 

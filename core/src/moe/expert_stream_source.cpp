@@ -58,6 +58,8 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     spec_adopt_ = cfg.route_ahead > 0;
     cache_max_ = (size_t) std::max(0, cfg.cache_mb) * 1024ull * 1024ull;
     io_threads_ = std::max(1, std::min(MoeStreamConfig::io_threads_max, cfg.io_threads));
+    async_expert_io_ = cfg.async_expert_io;
+    cpu_expert_fusion_ = cfg.cpu_expert_fusion;
     page_ = pio::vm_page(); // the real OS page size, for the dense-residency probe in any cache mode
 
     // Largest full-tensor byte size per projection, over all bound layers → shared-slot
@@ -214,7 +216,9 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     const size_t bounce_cap = max_slice + 2 * align_;
     for (const std::string & sp : shard_paths) {
         readers_.push_back(std::unique_ptr<FileReader>(new FileReader()));
-        if (!readers_.back()->open(sp, io_threads_, cfg.o_direct, align_, bounce_cap)) return false;
+        if (!readers_.back()->open(sp, io_threads_, cfg.o_direct && !cfg.async_expert_io, align_, bounce_cap,
+                                   cfg.async_expert_io))
+            return false;
     }
     // Each shard resolved direct for itself at open — the platform's answer plus the open-time
     // verify — so the run-level fact is the weakest shard: a mixed run must not be advertised as
@@ -224,6 +228,11 @@ bool ExpertStreamSource::init(const std::vector<std::string> & shard_paths,
     effective_direct_ = true;
     for (const auto & r : readers_)
         effective_direct_ = effective_direct_ && r->direct();
+    if (async_expert_io_) {
+        for (const auto & r : readers_)
+            async_expert_io_ = async_expert_io_ && r->asynchronous();
+        if (!async_expert_io_) std::fprintf(stderr, "bmoe: IOCP unavailable; using synchronous expert reader\n");
+    }
     for (const LayerExperts & L : layers_) {
         if (!L.bound) continue;
         for (int p = 0; p < MoeRecipe::max_exps; ++p)
@@ -321,8 +330,20 @@ bool ExpertStreamSource::reopen_readers() {
 // so the row carries this read's own cost, not the reader's running total.
 bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
     if (j.nbytes == 0) return true;
+    if (async_expert_io_) {
+        async_read_requests_.fetch_add(1, std::memory_order_relaxed);
+        const int in_flight = async_inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
+        int peak = async_high_water_.load(std::memory_order_relaxed);
+        while (in_flight > peak && !async_high_water_.compare_exchange_weak(peak, in_flight)) {
+        }
+    }
     const auto t0 = clock_t_::now();
     const long long window = readers_[(size_t) j.file]->read(lane, j.dst, j.off, j.nbytes);
+    if (async_expert_io_) {
+        async_inflight_.fetch_sub(1, std::memory_order_relaxed);
+        if (window >= 0 && ready_waiters_.load(std::memory_order_relaxed) == 0)
+            async_overlap_completions_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (window < 0) return false;
     if (coalesce_ && !j.spec) {
         demand_logical_bytes_.fetch_add(j.nbytes, std::memory_order_relaxed);
@@ -1086,6 +1107,17 @@ bool ExpertStreamSource::resident_bundle(int il,
     return true;
 }
 
+bool ExpertStreamSource::wait_resident_bundle(int il, int expert) {
+    if (!active_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return false;
+    if (!overlap_) return true;
+    for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+        const ggml_tensor * tensor = layers_[il].proj[p].tensor;
+        if (tensor) on_expert_ready(tensor, expert);
+        if (fatal_.load(std::memory_order_acquire)) return false;
+    }
+    return true;
+}
+
 uint64_t ExpertStreamSource::expert_bytes(int il) const {
     if (!active_ || il < 0 || il >= n_layer_ || !layers_[il].bound) return 0;
     return (uint64_t) entry_bytes(il);
@@ -1390,7 +1422,7 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
                 if (L.proj[p].nb2) return p;
             return -1;
         }();
-        const bool two_wave = two_wave_ && !load_all_ && p0 >= 0;
+        const bool two_wave = two_wave_ && !load_all_ && p0 >= 0 && !(cpu_expert_fusion_ && !prefill_phase_);
         seen_.assign(seen_.size(), 0); // reuse as a per-staged miss marker keyed by expert
         for (int e : staged_) {
             bool hit = false;
@@ -1495,6 +1527,12 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
     //    (A two-wave batch already published both waves inside the staging branch.)
     if (!published) {
         coalesce_jobs(0);
+        if (cpu_expert_fusion_ && !prefill_phase_) {
+            // A fused worker consumes all projections of one expert before taking the next.
+            // Keep coalesced slices intact while completing early experts ahead of later gates.
+            std::stable_sort(jobs_.begin(), jobs_.end(),
+                             [](const IoJob & a, const IoJob & b) { return a.expert < b.expert; });
+        }
         {
             std::lock_guard<std::mutex> lk(io_mtx_);
             batch_njobs_ = jobs_.size();
@@ -1609,6 +1647,7 @@ void ExpertStreamSource::on_expert_ready(const ggml_tensor * src0, int expert) {
 void ExpertStreamSource::enable_overlap_hook() {
 #ifdef BMOE_HAVE_EXPERT_READY_HOOK
     ggml_cpu_set_expert_ready_hook(&ExpertStreamSource::c_expert_ready, this);
+    ggml_cpu_set_expert_ffn_fusion(cpu_expert_fusion_);
     hook_registered_ = true;
 #endif
 }
@@ -1665,6 +1704,10 @@ void ExpertStreamSource::shutdown() {
     // Unregister the process-global hook FIRST: after this no compute thread can enter
     // on_expert_ready and touch members we are about to tear down.
     if (hook_registered_) {
+        if (cpu_expert_fusion_)
+            std::fprintf(stderr, "bmoe-cpu-expert-fusion: fused_calls=%llu\n",
+                         (unsigned long long) ggml_cpu_expert_ffn_fusion_count());
+        ggml_cpu_set_expert_ffn_fusion(false);
         ggml_cpu_set_expert_ready_hook(nullptr, nullptr);
         hook_registered_ = false;
     }
@@ -1718,6 +1761,19 @@ void ExpertStreamSource::shutdown() {
     dense_.shutdown();
     dense_tensors_.clear();
     row_tensors_.clear();
+    if (async_expert_io_) {
+        uint64_t bytes = 0, completed = 0;
+        for (const auto & reader : readers_) {
+            bytes += uint64_t(std::max(0LL, reader->read_bytes()));
+            completed += uint64_t(std::max(0LL, reader->async_completions()));
+        }
+        std::fprintf(stderr,
+                     "bmoe-io-async: physical_mib=%.2f read_requests=%llu completed_async=%llu "
+                     "io_wait_s=%.3f useful_overlap_completions=%llu queue_high_water=%d\n",
+                     double(bytes) / 1048576.0, (unsigned long long) async_read_requests_.load(),
+                     (unsigned long long) completed, stall_union_.total_ns() / 1e9,
+                     (unsigned long long) async_overlap_completions_.load(), async_high_water_.load());
+    }
     readers_.clear(); // closes every shard's lane fds and frees the bounces
     jobs_.clear();
     layers_.clear();

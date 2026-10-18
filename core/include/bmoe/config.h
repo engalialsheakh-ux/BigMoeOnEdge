@@ -83,6 +83,8 @@ struct MoeStreamConfig {
     // already read. Overlap + LRU cache only. Default off pending the on-device A/B.
     bool io_two_wave = false;
     bool io_coalesce = false; // merge adjacent demand slices within one projection, max 4 MiB
+    bool async_expert_io = false; // Windows IOCP reader; buffered, bounded by io_threads
+    bool cpu_expert_fusion = false; // opt-in whole-expert CPU FFN pipeline with bundle-ordered demand reads
 
     // Temporal prefetch: while a token computes layer l, speculatively read on the idle I/O
     // lanes the experts the PREVIOUS token routed at layers l+1..l+prefetch_layers, betting on
@@ -311,6 +313,8 @@ struct SpecConfig {
     // Past the source's acceptance horizon the extra drafts are rejected and paid for anyway, which
     // is why the useful range is small; 3 is upstream's default for a single trained head.
     int draft_max = 3;
+    bool adaptive_mtp = true; // MTP may lower the per-step width; --draft remains the ceiling
+    bool mtp_cost_explore = false; // Opt-in full-step cost sampling with bounded wider-width probes.
 
     // MTP only. Confidence floor for continuing to draft, as the head's own probability for the
     // token it is proposing. At 0 the head is asked for draft_max tokens unconditionally, however
@@ -496,12 +500,17 @@ struct RunConfig {
     struct GpuConfig {
         enum class FlashAttention { Auto, On, Off };
         enum class KvCacheType { F16, Q8_0, Q4_0 };
+        enum class ExpertMissMode { Cpu, Upload, Hybrid, DirectHost };
         int n_gpu_layers = 0;
         int main_gpu = 0;
-        int expert_cache_mb = 0;          // persistent CUDA expert storage; zero disables it
-        int safety_mb = 768;              // dedicated VRAM retained after expert-cache allocation
-        int expert_cache_window = 8;      // prior miss must recur within this many decode tokens
+        int expert_cache_mb = 0;                // persistent CUDA expert storage; zero disables it
+        int expert_performance_floor_mb = 1024; // runtime KV reclaim floor, capped by the configured cache target
+        bool expert_cache_auto = false;         // resolve a startup-only budget from dedicated VRAM
+        int safety_mb = 768;                    // dedicated VRAM retained after expert-cache allocation
+        int expert_cache_window = 8;            // prior miss must recur within this many decode tokens
         bool expert_cache_promote = true; // control for all-miss correctness probes
+        bool expert_overlap = false;      // opt-in independent CPU/GPU expert branch scheduling
+        ExpertMissMode expert_miss_mode = ExpertMissMode::Cpu;
         bool kv_offload = true;
         bool elastic_kv = false;             // grow physical KV context in chunks; logical n_ctx is unchanged
         int elastic_kv_chunk_tokens = 32768; // fixed production chunk; smaller values exercise growth in gates

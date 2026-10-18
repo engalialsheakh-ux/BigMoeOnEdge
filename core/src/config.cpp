@@ -87,6 +87,9 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.gpu.expert_cache_mb < 0) {
         return fail("gpu.expert_cache_mb must be >= 0");
     }
+    if (cfg.gpu.expert_performance_floor_mb < 0) {
+        return fail("gpu.expert_performance_floor_mb must be >= 0");
+    }
     if (cfg.gpu.safety_mb < 128) {
         return fail("gpu.safety_mb must be >= 128");
     }
@@ -94,17 +97,38 @@ ValidationResult validate(const RunConfig & cfg) {
                                (cfg.gpu.elastic_kv_chunk_tokens & (cfg.gpu.elastic_kv_chunk_tokens - 1)) != 0)) {
         return fail("gpu.elastic_kv_chunk_tokens must be a power of two in [512,32768]");
     }
-    if (cfg.gpu.elastic_kv && (cfg.gpu.n_gpu_layers != -1 || !cfg.gpu.kv_offload || !cfg.moe.enabled ||
-                               (cfg.spec.enabled() && !cfg.spec.is_mtp()) || cfg.prefill.enabled() || cfg.decide.enabled)) {
-        return fail(
-            "elastic KV requires full CUDA MoE streaming and GPU KV, without non-MTP speculation, prefill device, or decide");
+    if (cfg.gpu.elastic_kv &&
+        (cfg.gpu.n_gpu_layers != -1 || !cfg.gpu.kv_offload || !cfg.moe.enabled ||
+         (cfg.spec.enabled() && !cfg.spec.is_mtp()) || cfg.prefill.enabled() || cfg.decide.enabled)) {
+        return fail("elastic KV requires full CUDA MoE streaming and GPU KV, without non-MTP speculation, prefill "
+                    "device, or decide");
     }
     if (cfg.gpu.expert_cache_window < 1 || cfg.gpu.expert_cache_window > 64) {
         return fail("gpu.expert_cache_window must be in [1,64]");
     }
-    if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1)) {
-        return fail("gpu.expert_cache_mb requires --moe-stream and --n-gpu-layers -1");
+    if (cfg.gpu.expert_cache_auto && cfg.gpu.expert_cache_mb > 0) {
+        return fail("gpu.expert_cache_auto conflicts with an explicit GPU expert cache size");
     }
+    if ((cfg.gpu.expert_cache_mb > 0 || cfg.gpu.expert_cache_auto) &&
+        (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1)) {
+        return fail("GPU expert cache requires --moe-stream and --n-gpu-layers -1");
+    }
+    using ExpertMissMode = RunConfig::GpuConfig::ExpertMissMode;
+    if (cfg.gpu.expert_overlap &&
+        ((!cfg.gpu.expert_cache_auto && cfg.gpu.expert_cache_mb <= 0) ||
+         cfg.gpu.expert_miss_mode != ExpertMissMode::Cpu)) {
+        return fail("gpu.expert_overlap requires a GPU expert cache and --gpu-expert-miss-mode cpu");
+    }
+    if (cfg.gpu.expert_miss_mode == ExpertMissMode::DirectHost)
+        return fail("direct-host expert GEMV is unsupported by the discrete CUDA buffer scheduler");
+    if ((cfg.gpu.expert_miss_mode == ExpertMissMode::Upload || cfg.gpu.expert_miss_mode == ExpertMissMode::Hybrid) &&
+        (cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled ||
+         (!cfg.gpu.expert_cache_auto && cfg.gpu.expert_cache_mb <= 0) ||
+         (!cfg.moe.cache_auto && cfg.moe.cache_mb <= 0)))
+        return fail("GPU miss execution requires full CUDA MoE placement, a GPU expert pool, and a RAM expert cache");
+    if (cfg.gpu.expert_miss_mode != ExpertMissMode::Cpu && cfg.gpu.expert_miss_mode != ExpertMissMode::Upload &&
+        cfg.gpu.expert_miss_mode != ExpertMissMode::Hybrid && cfg.gpu.expert_miss_mode != ExpertMissMode::DirectHost)
+        return fail("gpu.expert_miss_mode must be cpu, upload, hybrid, or direct-host");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled()) {
         return fail("GPU layer offload does not combine with prefill.device");
     }
@@ -126,8 +150,7 @@ ValidationResult validate(const RunConfig & cfg) {
     }
     const int tile = cfg.layer_tile_tokens;
     if (tile != 0 && (tile != -1 && (tile < 512 || tile > 8192 || (tile & (tile - 1)) != 0) || cfg.n_ubatch != 64 ||
-                      cfg.n_ctx < 512 || (tile > 0 && tile > cfg.n_ctx) ||
-                      (cfg.spec.enabled() && !cfg.spec.is_mtp()) ||
+                      cfg.n_ctx < 512 || (tile > 0 && tile > cfg.n_ctx) || (cfg.spec.enabled() && !cfg.spec.is_mtp()) ||
                       cfg.prefill.enabled() || cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled)) {
         return fail("prefill.layer_tile_tokens requires auto or a power-of-two tile from 512 to 8192, --ubatch 64, "
                     "--moe-stream, full CUDA placement, and no non-MTP speculation or prefill device");
@@ -164,6 +187,9 @@ ValidationResult validate(const RunConfig & cfg) {
     // is an evidence boundary, not a physical one — see SpecConfig::draft_max.
     if (cfg.spec.enabled() && (cfg.spec.draft_max < 1 || cfg.spec.draft_max > SpecConfig::draft_max_limit)) {
         return fail("spec.draft_max must be in [1, " + std::to_string(SpecConfig::draft_max_limit) + "]");
+    }
+    if (cfg.spec.mtp_cost_explore && (!cfg.spec.is_mtp() || !cfg.spec.adaptive_mtp)) {
+        return fail("spec.mtp_cost_explore requires --mtp with adaptive drafting (without --mtp-fixed-draft)");
     }
     // A probability, so [0,1]. 1 would mean "only draft what the head is certain of", which is a
     // legitimate (if extreme) setting; above 1 nothing would ever be drafted and the flag would be
@@ -283,6 +309,15 @@ ValidationResult validate(const RunConfig & cfg) {
     if (cfg.moe.io_coalesce && (!cfg.moe.enabled || !cfg.moe.overlap)) {
         return fail("moe.io_coalesce requires MoE streaming with overlap");
     }
+    if (cfg.moe.async_expert_io && (!cfg.moe.enabled || !cfg.moe.overlap)) {
+        return fail("moe.async_expert_io requires MoE streaming with overlap");
+    }
+    if (cfg.moe.cpu_expert_fusion && (!cfg.moe.enabled || !cfg.moe.overlap)) {
+        return fail("moe.cpu_expert_fusion requires MoE streaming with overlap");
+    }
+#if !defined(_WIN32)
+    if (cfg.moe.async_expert_io) return fail("moe.async_expert_io requires Windows");
+#endif
 
     if (cfg.moe.enabled) {
         const MoeStreamConfig & m = cfg.moe;

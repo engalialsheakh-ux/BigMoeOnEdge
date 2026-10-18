@@ -13,12 +13,14 @@ FileReader::~FileReader() {
     close();
 }
 
-bool FileReader::open(const std::string & path, int lanes, bool direct, size_t align, size_t bounce_cap) {
+bool FileReader::open(
+    const std::string & path, int lanes, bool direct, size_t align, size_t bounce_cap, bool asynchronous) {
     if (is_open()) return false;
     // Recorded after the guard: a refused call must not overwrite what reopen() replays.
     path_ = path;
     lanes_ = lanes;
     direct_req_ = direct;
+    async_req_ = asynchronous;
     bounce_cap_ = bounce_cap;
     align_ = align ? align : 4096;
     direct_ = direct;
@@ -39,6 +41,11 @@ bool FileReader::open(const std::string & path, int lanes, bool direct, size_t a
     // FILE_FLAG_NO_BUFFERING reject unaligned windows and need the bounce and the buffered tail fd;
     // Apple's F_NOCACHE is a caching hint, so an uncached reader there keeps plain preads.
     aligned_reads_ = direct_ && pio::direct_needs_alignment();
+#if defined(_WIN32)
+    async_ = asynchronous && !aligned_reads_;
+#else
+    async_ = false;
+#endif
 
     // Verify O_DIRECT actually returns correct bytes on this storage. On some emulated / FUSE-backed
     // volumes (e.g. an app-private dir under /storage/emulated) the open SUCCEEDS but direct reads
@@ -78,14 +85,29 @@ bool FileReader::open(const std::string & path, int lanes, bool direct, size_t a
     fds_buf_.assign(n, pio::fd_invalid);
     bounces_.assign(n, nullptr);
     bounce_sz_.assign(n, 0);
+#if defined(_WIN32)
+    completion_ports_.assign(n, nullptr);
+#endif
     for (int lane = 0; lane < n; ++lane) {
-        fds_[lane] = (lane == 0) ? primary : pio::open_read(path.c_str(), direct_);
+        if (lane == 0 && async_) pio::close_fd(primary);
+        fds_[lane] = (lane == 0 && !async_) ? primary : pio::open_read(path.c_str(), direct_, nullptr, async_);
         fds_buf_[lane] = aligned_reads_ ? pio::open_read(path.c_str(), false) : pio::fd_invalid;
         if (!pio::fd_ok(fds_[lane])) {
             std::fprintf(stderr, "bmoe: lane %d open failed\n", lane);
+            const bool retry_sync = async_;
             close();
-            return false;
+            return retry_sync ? open(path, lanes, direct, align, bounce_cap, false) : false;
         }
+#if defined(_WIN32)
+        if (async_) {
+            completion_ports_[lane] = pio::make_completion_port(fds_[lane]);
+            if (!completion_ports_[lane]) {
+                std::fprintf(stderr, "bmoe: IOCP setup failed; using synchronous reader\n");
+                close();
+                return open(path, lanes, direct, align, bounce_cap, false);
+            }
+        }
+#endif
         // Not fatal — the buffered fd is only needed for a read that runs into a sub-alignment EOF
         // tail, which expert slices never do. But say so here, where the cause (fd pressure) is still
         // visible, rather than leaving a later tail read to fail with an unexplained EINVAL.
@@ -117,7 +139,19 @@ long long FileReader::read(int lane, void * dst, uint64_t off, uint64_t nbytes) 
         const uint64_t end = (fsize_ && off + nbytes > fsize_) ? fsize_ : off + nbytes;
         const auto t0 = clock_t_::now();
         for (uint64_t a = off; a < end;) {
-            long long got = pio::pread_at(fd, (char *) dst + (a - off), (size_t) (end - a), a);
+            long long got;
+#if defined(_WIN32)
+            if (async_) {
+                const int in_flight = async_inflight_.fetch_add(1, std::memory_order_relaxed) + 1;
+                int peak = async_high_water_.load(std::memory_order_relaxed);
+                while (in_flight > peak && !async_high_water_.compare_exchange_weak(peak, in_flight)) {
+                }
+                got = pio::pread_at_iocp(fd, completion_ports_[lane], (char *) dst + (a - off), (size_t) (end - a), a);
+                async_inflight_.fetch_sub(1, std::memory_order_relaxed);
+                if (got >= 0) async_completions_.fetch_add(1, std::memory_order_relaxed);
+            } else
+#endif
+                got = pio::pread_at(fd, (char *) dst + (a - off), (size_t) (end - a), a);
             if (got <= 0) {
                 std::fprintf(stderr, "bmoe: pread failed at %llu\n", (unsigned long long) a);
                 return -1;
@@ -189,13 +223,19 @@ bool FileReader::reopen() {
     const std::string path = path_;
     const int lanes = lanes_;
     const bool direct = direct_req_;
+    const bool asynchronous = async_req_;
     const size_t align = align_;
     const size_t cap = bounce_cap_;
     close();
-    return open(path, lanes, direct, align, cap);
+    return open(path, lanes, direct, align, cap, asynchronous);
 }
 
 void FileReader::close() {
+#if defined(_WIN32)
+    for (void * port : completion_ports_)
+        if (port) pio::close_fd(port);
+    completion_ports_.clear();
+#endif
     for (pio::fd_t fd : fds_)
         if (pio::fd_ok(fd)) pio::close_fd(fd);
     for (pio::fd_t fd : fds_buf_)

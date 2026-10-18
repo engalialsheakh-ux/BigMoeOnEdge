@@ -441,6 +441,25 @@ int main(int argc, char ** argv) {
     fails += check("G4b overlap(LRU cache) == streaming(cache off)", s_s0, s_ovc);
     fails += check("G4c overlap(io_threads=1) == streaming(cache off)", s_s0, s_ov1);
     fails += check("G4d overlap(two-wave publish) == streaming(cache off)", s_s0, s_ov2w);
+#if defined(_WIN32)
+    RunConfig ov_iocp = ovc;
+    ov_iocp.moe.async_expert_io = true;
+    std::string s_iocp;
+    if (!gen(ov_iocp, s_iocp, err)) {
+        std::fprintf(stderr, "overlap(IOCP) run failed: %s\n", err.c_str());
+        return 2;
+    }
+    fails += check("G4e overlap(IOCP) == streaming(cache off)", s_s0, s_iocp);
+#endif
+    RunConfig ov_fused = ovc;
+    ov_fused.moe.cpu_expert_fusion = true;
+    ov_fused.moe.io_coalesce = true;
+    std::string s_fused;
+    if (!gen(ov_fused, s_fused, err)) {
+        std::fprintf(stderr, "overlap(CPU expert fusion) run failed: %s\n", err.c_str());
+        return 2;
+    }
+    fails += check("G4f overlap(CPU expert fusion) == streaming(cache off)", s_s0, s_fused);
 #else
     std::printf("[SKIP] G4 (expert-ready hook not built)\n");
 #endif

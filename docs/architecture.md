@@ -113,6 +113,8 @@ The composition root is `Session` (core/src/engine/session.cpp):
 2. `generate()` — prefill the prompt, then greedily decode `n_predict` tokens, reporting
    per-token metrics. Callable repeatedly; the expert cache stays warm between calls (see
    [session.md](session.md)). Cancellable mid-flight via the abort callback.
+   Structured session messages and tools use the same decode loop; llama.cpp common chat
+   renders the model template and parses assistant tool calls.
    `decide()` is the other way to use an open session: one prefill and no decode, reading which of
    a list of choices the model would answer (off unless the session is opened with it; see
    [decide.md](decide.md)).

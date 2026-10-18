@@ -59,13 +59,15 @@ identical text, GPU-hit counts, SSD byte counts, and promotion counts within
 each matched pair. The 256-token pair ran in the reverse order from the
 128-token pair to expose order-sensitive short-run gains.
 
-| Completion | Earlier baseline I/O | Two-wave I/O | Result |
+| Historical pre-release-mmap completion | Earlier baseline I/O | Two-wave I/O | Result |
 | --- | ---: | ---: | --- |
 | 128 tokens, decode tokens/s | 8.408 | 8.810 | Two-wave +4.8% |
 | 128 tokens, stall ms/token | 40.1 | 37.9 | Two-wave -2.2 ms |
 | 256 tokens, decode tokens/s | 9.804 | 9.768 | Two-wave -0.4% |
 | 256 tokens, stall ms/token | 33.4 | 33.0 | Two-wave -0.4 ms |
 
+These stalls are from the earlier experiment; the active post-release-mmap
+measurement is about 29 ms/token overall and 25 ms/token over tokens 129-256.
 The longer confirmation did not reproduce a throughput gain, so no runtime
 flag, default, or documentation recipe was changed. The earlier positive
 128-token screen is treated as warm-up/order noise. No long agent benchmark
@@ -87,9 +89,9 @@ Prior CUDA-launch analysis placed its optimistic saving at about 3 ms/token,
 and the installed CUDA backend already uses the eligible fused expert path.
 
 The historical 9.261 tokens/s, 9.717 s restored first response, exact replay,
-and memory budget remain the result of this earlier investigation. No production
-inference code or llama.cpp source changed. A material step from that result
-toward 11 tokens/s would require saving roughly 17 ms of its 108 ms token,
+and memory budget remain the result of this earlier investigation. It changed
+no production inference code or llama.cpp source. A material step from that
+result toward 11 tokens/s would require saving roughly 17 ms of its 108 ms token,
 most plausibly by starting *exact*
 expert reads before their layer stalls without adding speculative flash
 traffic. That would need a verified early-router/graph schedule and bounded
@@ -109,18 +111,81 @@ hashes and identical expert read volume. The prototype was removed: its
 roughly 0.7% end-to-end saving does not justify enabling a path that failed
 the exact-output screen. The production Claude bridge remains unchanged.
 
-Elastic GPU KV capacity is DEFERRED-BLOCKED by the current storage layout. For
-this hybrid model, memory creation in `llama-model.cpp` passes `cparams.n_ctx_seq` as
-`attn_kv_size` to `llama_memory_hybrid`, whose attention member is a
-`llama_kv_cache`. Its constructor creates full-`kv_size` K/V tensors with
-`ggml_new_tensor_3d` and immediately allocates their backend storage with
-`ggml_backend_alloc_ctx_tensors_from_buft`. The cache's `state_write_data` and
-`state_read_data` address saved cells through the current cache dimensions;
-`state_read_meta` also finds slots in the already-sized cell array. A growing
-physical layout must preserve those serialized positions and exact prefix
-restore. Separately, `GpuExpertPool::init` fixes slot counts and offsets from
-the configured budget, then allocates one device buffer of that budget. Using
-freed KV VRAM for experts and later returning it would require coordinated KV
-growth, compatible state read/write, and pool resizing only after uploads and
-graph pins drain. A flag or one allocator edit cannot safely provide that
-single-sequence behavior while retaining the 262,144-token logical context.
+The physical KV portion of this audit is now an opt-in implementation. Source
+inspection found that `llama-model.cpp` passed `cparams.n_ctx_seq` as
+`attn_kv_size` to `llama_memory_hybrid`; its attention `llama_kv_cache` creates
+full-capacity K/V tensors with `ggml_new_tensor_3d` and allocates their backend
+storage with `ggml_backend_alloc_ctx_tensors_from_buft`. The local llama.cpp
+delta passes an independent physical `n_kv` while retaining the full logical
+`n_ctx_seq`. BigMoe saves the hybrid sequence state, recreates only the context
+over the already-loaded model, and restores it. The existing `state_write_data`,
+`state_read_meta`, and `state_read_data` paths depend on compatible cell
+positions and destination capacity; a focused gate checked live-state growth
+and agent/Claude prefix restart restore. At logical context 262,144 with Q4_0
+K/V, the real model reserved 180 MiB of KV at startup rather than 1,440 MiB.
+The tiny hybrid gate measured roughly 3–4 ms for a 512-to-1,024-cell
+grow/recreate/restore event. This is not a real-model growth timing. A separate
+real-model Claude prefix restart restored 576 tokens, evaluated 10 prompt
+tokens versus 586 cold, and produced identical eight-token greedy output.
+
+Dynamic sharing with the GPU expert pool remains blocked by the exact-output
+requirement. `GpuExpertPool::init` derives slot counts and offsets from a fixed
+VRAM budget and allocates one device buffer. A trial drained uploads, released
+the old context and graph, resized the pool, and restored resident experts
+before growing KV. At startup it raised the real model's pool from 1,500 MiB
+and 848 slots to 2,724 MiB and 1,574 slots. In one matched 128-token screen,
+the original and Elastic-KV-only runs produced identical text at 7.527 and
+7.668 tokens/s. The larger-pool run reached 9.103 tokens/s but changed a later
+greedy token; its storage stall was 38 ms/token versus 46 ms/token in that
+short screen. These values do not replace the active post-release-mmap stall
+baseline above. The pool-sharing trial was removed; guaranteeing exact output
+across changed CPU/GPU expert placements needs more than a budget or allocator
+change.
+
+## Rejected exact shadow VRAM rescue
+
+A separate trial kept the active GPU expert pool fixed at 1,500 MiB and 848
+slots. It stored original compressed expert bundles in an inclusive shadow
+pool: restoring a bundle to RAM left its shadow copy valid. Four pinned host
+staging slots and a dedicated CUDA stream accepted best-effort asynchronous
+insertions; a busy ring dropped an insertion without waiting for H2D. Restores
+copied shadow VRAM to pinned memory and then to the existing CPU expert slot.
+The trial did not change routing, expert arithmetic, or Elastic KV.
+
+A microbenchmark using one real 1.6875 MiB expert bundle measured 0.100 ms
+host-visible / 0.201 ms device time for pageable H2D. Pinned staging took
+0.077 ms of CPU memcpy, 0.020 ms to enqueue, and 0.147 ms of H2D device time.
+The dedicated-stream ring's accepted insertions were host-visible for about
+0.105 ms. D2H took 0.145 ms on device and 0.137 ms of host wait, followed by
+0.146 ms pinned-to-RAM memcpy (5.81 GiB/s effective). A direct SSD read of
+the same bundle took about 1.87 ms. The primitive times justified one bounded
+end-to-end screen, but did not establish a throughput gain.
+
+The matched 128-token screen used the same greedy prompt, model, fixed GPU
+expert pool, 4,400 MiB RAM cache, and 262,144-token logical / 32,768-token
+initial physical KV. Its shadow budget was 1,224 MiB. The generated text was
+identical; active GPU hits, CPU misses, promotions, and evictions were also
+identical at 17,891 / 23,069 / 3,371 / 2,523. No route trace was captured in
+this screen, so it establishes counter parity rather than a row-by-row routing
+proof for the rescue variant. An earlier 128-token shadow screen recorded
+48,320 identical routing/GPU-hit rows against its baseline.
+
+| 128-token measure | Shadow off | Shadow on, checksum off |
+| --- | ---: | ---: |
+| Decode throughput | 5.544 tokens/s | 5.406 tokens/s |
+| Flash read | 13,134.5 MiB | 10,644.1 MiB |
+| Flash I/O stall | 72 ms/token | 57 ms/token |
+| RAM-cache management | 12 ms/token | 42 ms/token |
+| Shadow hits / misses | — | 1,466 / 9,094 |
+| Insert attempts / completed / dropped busy | — | 7,953 / 7,817 / 136 |
+| H2D | — | 13,191.2 MiB / 1,462.5 ms device |
+| D2H | — | 2,473.9 MiB / 227.6 ms device |
+| Staging / restore memcpy | — | 2,250.7 / 760.8 ms |
+| Shadow management | — | 3,739.9 ms total, 29.2 ms/token |
+
+With insertion/restore checksums enabled, the same output had zero detected
+byte mismatches, but throughput fell to 2.415 tokens/s; that diagnostic run
+was not used for the throughput decision. Even without checksum cost, the
+shadow path was about 2.5% slower than its matched baseline. The prototype
+and its CLI/config/CMake surface were removed. The experimental logs remain
+outside the tracked source tree; there is no shadow runtime option.

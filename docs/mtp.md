@@ -18,7 +18,8 @@ backing is shared. The target keeps a 1,500 MiB GPU expert cache (848 slots),
 4,400 MiB RAM expert cache, 128 MiB GPU safety reserve, release-mmap, GPU Q4_0
 K/V, and a logical context of 262,144 tokens. `--elastic-kv` starts physical KV
 at 32,768 cells and grows it without reloading weights. Rolling agent and
-stable Claude prefix checkpoints include both target and MTP draft states;
+stable Claude prefix checkpoints include target state, MTP draft state, and the
+driver's carried hidden row;
 older or mismatched checkpoints are rejected by their model/configuration key.
 
 The same-GGUF 128-token screen measured 7.227 tokens/s without MTP and 7.97
@@ -172,8 +173,19 @@ without thermal gating, so the *mechanism* counters are the trustworthy part, no
 ## Stopping early when the head is unsure (`--mtp-p-min`)
 
 The draft loop already knows how confident the head is in each token it proposes. `--mtp-p-min F`
-stops drafting as soon as that confidence falls below `F`; at the default `0` it never stops and
-always drafts the full width.
+stops drafting as soon as that confidence falls below `F`; at the default `0` confidence alone does
+not stop a draft. An acceptance-history controller starts at width two, widens after repeated fully
+accepted drafts, and narrows after rejections or abstentions. `--draft` is its hard ceiling;
+`--mtp-fixed-draft` requests that ceiling on each step for comparison. The target still verifies
+every proposed token before acceptance.
+
+The adaptive controller also keeps a small rolling cost record by verification width. It uses the
+target pass already performed to measure accepted tokens, verification time, unique expert cache
+lookups, misses, and CPU fallback contributions. Before the next draft, it compares predicted
+verified-token progress per millisecond at adjacent widths, using the recent miss rate and observed
+stall per miss. It can cap the draft before target verification when a wider batch has been slower.
+`bmoe-mtp-cost` reports proposed and selected draft totals, the actual verification-width histogram,
+expert pressure, CPU fallback contributions, and accepted drafts per verification unit.
 
 On a streamed device this pays twice, which is why it is the cheapest lever available: a draft not
 made is a pass through the MTP block — with its own MoE FFN, and therefore its own expert reads —
@@ -190,9 +202,11 @@ would no longer be the single-token run it claims to be.
 
 ## How it is wired
 
-The whole draft/verify orchestration is llama.cpp's, reached through `common/speculative.h`, which
-depends only on public headers. **No llama.cpp patch, no fork, no submodule pin of our own** — the
-same rule the rest of the engine follows ([seam.md](seam.md)).
+The draft/verify orchestration is llama.cpp's, reached through `common/speculative.h`, which
+depends only on public headers. A small submodule change adds serialization of the MTP
+driver's carried hidden row through that existing `common` state API. The engine saves it with
+target and draft sequence snapshots for prompt reuse and elastic-KV resizing. The streaming
+seam remains separate ([seam.md](seam.md)).
 
 Self-speculation means one model and two contexts over it:
 
@@ -202,19 +216,20 @@ Self-speculation means one model and two contexts over it:
   nextn graph, and carrying the **same eval callback** as the target — the router hook is per-context,
   not per-model.
 
-That callback is what makes the MTP block visible to the streamer. The head lives at layer index
-`n_layer` — contiguous with the trunk, same `ffn_{gate,up,down}_exps` tensor naming, same expert
-count — so with `--mtp` on, the hook and the expert source are sized `n_layer + n_layer_nextn`
-and the head's experts are streamed, cached and dropped like any other layer's. Two things follow
-from that and are easy to get wrong:
+That callback makes the MTP block visible to the capture pass. The head lives at layer index
+`n_layer`, contiguous with the trunk and using the same expert tensor naming and count. On a full
+CUDA hybrid run, every captured MTP expert tensor is uploaded once into a separate permanent GPU
+bank before the model mapping is released. The trunk GPU pool remains a bounded cache. The source
+keeps the MTP layer index but does not bind its tensors or read MTP experts per token. CPU runs
+continue to stream the MTP layer. Two details matter:
 
 - The capture warm-up has to run on the **draft** context too. The MTP graph is only ever built by a
   decode there, so a warm-up on the target alone never harvests the head's expert tensors, and they
-  would stay mmap-resident — the fault storm streaming exists to avoid.
+  would stay mmap-resident or be omitted from the GPU bank.
 - Prefill goes through the driver as well. The draft context's KV must reach the last prompt
   position or the first draft is conditioned on a state that never saw the prompt.
 
-Per step the loop is: draft `--draft` tokens from the head, decode
+Per step the loop drafts up to `--draft` tokens from the head, then decodes
 `[confirmed token, drafts…]` asking for logits at every position, accept the longest prefix whose
 argmax matches, let the draft context catch up on **that prefix**, roll the target's KV back over the
 rejected tail, and read the next token for free out of the logits at the first unverified position.

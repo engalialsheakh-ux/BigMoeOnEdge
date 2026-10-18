@@ -15,6 +15,7 @@
 #include "bmoe/route_trace.h"
 #include "bmoe/decode_trace.h"
 #include "bmoe/version.h"
+#include "chat.h"
 
 #include <atomic>
 #include <cerrno>
@@ -251,6 +252,8 @@ static bool json_get_bool(const std::string & line, const char * key, bool dflt)
 struct SessionCmd {
     enum Kind { kGenerate, kDecide, kClose } kind;
     std::string prompt;
+    std::string messages_json, tools_json, tool_choice = "auto", request_error;
+    bool parallel_tool_calls = true;
     std::string claude_prefix;
     bool claude_prewarm = false;
     int id = 0;
@@ -327,7 +330,7 @@ static int run_session_loop(const RunConfig & cfg,
     // anything sensible about --drop-cold-experts, whose threshold is a fraction of 1/top-k: the
     // same percentage trims a tail at 8 and takes half the routing at 2. 0 on a non-MoE model.
     std::printf("BMOE_READY {\"load_s\":%.3f,\"arch\":\"%s\",\"n_ctx\":%d,\"think_ctl\":\"%s\","
-                "\"n_expert_used\":%d}\n",
+                "\"n_expert_used\":%d,\"capabilities\":{\"structured_chat\":true}}\n",
                 session->load_seconds(), json_escape(session->arch()).c_str(), session->n_ctx(),
                 bmoe::think_control_name(session->think_control()), session->n_expert_used());
     std::fflush(stdout);
@@ -361,6 +364,23 @@ static int run_session_loop(const RunConfig & cfg,
                 c.n_predict = json_get_int(line, "n_predict", cfg.n_predict);
                 c.think = json_get_bool(line, "think", cfg.think);
                 c.clear_kv = json_get_bool(line, "clear_kv", true);
+                try {
+                    const common_json request = common_json::parse(line);
+                    if (request.contains("messages")) {
+                        c.messages_json = request.at("messages").dump();
+                        c.tools_json = request.value("tools", common_json::array()).dump();
+                        c.tool_choice = request.value("tool_choice", std::string("auto"));
+                        c.parallel_tool_calls = request.value("parallel_tool_calls", true);
+                        c.id = request.value("id", 0);
+                        c.n_predict = request.value("n_predict", cfg.n_predict);
+                        c.think = request.value("think", cfg.think);
+                        c.clear_kv = request.value("clear_kv", true);
+                        c.claude_prefix = request.value("claude_prefix", std::string());
+                        c.claude_prewarm = request.value("claude_prewarm", false);
+                    }
+                } catch (const std::exception & e) {
+                    c.request_error = e.what();
+                }
             } else if (cmd == "decide") {
                 c.kind = SessionCmd::kDecide;
                 c.id = json_get_int(line, "id", 0);
@@ -410,25 +430,42 @@ static int run_session_loop(const RunConfig & cfg,
 
         std::printf("BMOE_BEGIN {\"id\":%d}\n", cmd.id);
         std::fflush(stdout);
+        if (!cmd.request_error.empty()) {
+            std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":false,\"msg\":\"%s\"}\n", cmd.id,
+                        json_escape(cmd.request_error).c_str());
+            std::fflush(stdout);
+            continue;
+        }
 
         GenerateRequest req;
         req.prompt = cmd.prompt;
+        req.messages_json = cmd.messages_json;
+        req.tools_json = cmd.tools_json;
+        req.tool_choice = cmd.tool_choice;
+        req.parallel_tool_calls = cmd.parallel_tool_calls;
         req.claude_prefix = cmd.claude_prefix;
         req.claude_prewarm = cmd.claude_prewarm;
         req.n_predict = cmd.n_predict;
         req.think = cmd.think;
         req.clear_kv = cmd.clear_kv;
-        req.render_text = true; // the line protocol carries the parsed answer on every token
+        req.render_text = cmd.messages_json.empty(); // structured callers consume the parsed final result
 
         ProgressDelta pd; // fresh per generation: the first line extends the empty state
         RunResult r = session->generate(req, [&](const TokenMetrics & m) { emit_progress_line(m, pd); }, sink);
         if (!r) {
             // A bad request (empty prompt, context overflow) leaves the session usable; a decode
             // failure means the context is compromised, so end the loop.
-            bool recoverable = r.error.find("exceeds the session n_ctx") != std::string::npos ||
+            bool recoverable = r.context_pressure || r.error.find("exceeds the session n_ctx") != std::string::npos ||
                                r.error.find("empty prompt") != std::string::npos;
-            std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":%s,\"msg\":\"%s\"}\n", cmd.id, recoverable ? "false" : "true",
-                        json_escape(r.error).c_str());
+            if (r.context_pressure)
+                std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":false,\"code\":\"context_pressure\","
+                            "\"required_kv_tokens\":%d,\"current_kv_tokens\":%d,\"expert_floor_mb\":%d,"
+                            "\"expert_cache_mb\":%d,\"msg\":\"%s\"}\n",
+                            cmd.id, r.required_kv_tokens, r.current_kv_tokens, r.expert_floor_mb, r.expert_cache_mb,
+                            json_escape(r.error).c_str());
+            else
+                std::printf("BMOE_ERROR {\"id\":%d,\"fatal\":%s,\"msg\":\"%s\"}\n", cmd.id,
+                            recoverable ? "false" : "true", json_escape(r.error).c_str());
             std::fflush(stdout);
             if (!recoverable) {
                 rc = 1;
@@ -437,6 +474,13 @@ static int run_session_loop(const RunConfig & cfg,
             continue;
         }
         const RunSummary & s = r.summary;
+        std::string tool_calls = "[";
+        for (const auto & call : r.tool_calls) {
+            if (tool_calls.size() > 1) tool_calls += ',';
+            tool_calls += "{\"name\":\"" + json_escape(call.name) + "\",\"arguments\":\"" +
+                          json_escape(call.arguments) + "\",\"id\":\"" + json_escape(call.id) + "\"}";
+        }
+        tool_calls += ']';
         std::printf("BMOE_DONE {\"id\":%d,\"cancelled\":%s,\"tokens\":%d,\"tok_s\":%.3f,\"prefill_s\":%.3f,"
                     "\"prefill_tps\":%.2f,\"load_s\":%.3f,\"cache_hit_pct\":%.1f,\"n_prompt\":%d,\"n_past\":%d,"
                     "\"compute_s_tok\":%.4f,\"io_s_tok\":%.4f,\"cache_resident_mib\":%.0f,\"cache_budget_mib\":%.0f,"
@@ -451,7 +495,10 @@ static int run_session_loop(const RunConfig & cfg,
                     "\"prefill_dev_stall_s\":%.3f,"
                     "\"token_demand_mib\":%.1f,\"mtp_drafted\":%lld,\"mtp_accepted\":%lld,\"mtp_decodes\":%lld,"
                     "\"mtp_draft_s_tok\":%.4f,\"drafted_steps\":%lld,\"loop_overhead_s_tok\":%.4f,"
-                    "\"reasoning\":\"%s\",\"text\":\"%s\"}\n",
+                    "\"reasoning\":\"%s\",\"text\":\"%s\",\"raw\":\"%s\",\"structured_chat\":%s,\"tool_calls\":%s,"
+                    "\"stop_reason\":\"%s\",\"target_kv_bytes\":%zu,\"target_kv_tokens\":%d,"
+                    "\"draft_kv_bytes\":%zu,\"draft_kv_tokens\":%d,\"gpu_expert_cache_bytes\":%zu,"
+                    "\"expert_floor_mb\":%d}\n",
                     cmd.id, r.cancelled ? "true" : "false", s.n_generated, s.tokens_per_second, s.prefill_seconds,
                     (s.prefill_seconds > 0 ? s.n_prompt / s.prefill_seconds : 0.0), s.load_seconds, s.cache_hit_pct,
                     s.n_prompt, s.n_past, s.moe_compute_s_per_token, s.moe_io_s_per_token, s.cache_resident_mib,
@@ -463,7 +510,11 @@ static int run_session_loop(const RunConfig & cfg,
                     s.prefill_device_tokens, s.prefill_device_nodes, s.prefill_device_read_mib,
                     s.prefill_device_stall_seconds, s.token_demand_mib, s.mtp_drafted, s.mtp_accepted, s.mtp_decodes,
                     s.mtp_draft_s_per_token, s.drafted_steps, s.loop_overhead_s_per_token,
-                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str());
+                    json_escape(r.reasoning_text).c_str(), json_escape(r.generated_text).c_str(),
+                    json_escape(r.raw_generated_text).c_str(), cmd.messages_json.empty() ? "false" : "true",
+                    tool_calls.c_str(), json_escape(r.stop_reason).c_str(), session->physical_kv_bytes(),
+                    session->physical_kv_tokens(), session->draft_kv_bytes(), session->draft_kv_tokens(),
+                    session->gpu_expert_cache_bytes(), session->expert_performance_floor_mb());
         std::fflush(stdout);
     }
 
@@ -551,13 +602,19 @@ static void print_usage(const char * argv0) {
         "      --n-gpu-layers N    CUDA layers: 0=CPU (default), -1=all eligible, N=partial\n"
         "      --main-gpu N        CUDA device index (default 0)\n"
         "      --gpu-expert-cache-mb N  reserve N MiB of dedicated VRAM for expert slots (default 0)\n"
+        "      --gpu-expert-cache-auto  size the startup trunk pool from available dedicated VRAM\n"
+        "      --gpu-expert-overlap  overlap independent CPU/GPU expert branches (cpu miss mode)\n"
+        "      --gpu-expert-miss-mode cpu|upload|hybrid|auto|direct-host  select exact expert miss execution (default "
+        "cpu)\n"
         "      --expert-access-trace PATH  record exact expert demands for offline cache replay\n"
         "      --io-coalesce      merge adjacent expert slices into bounded demand reads\n"
+        "      --cpu-expert-fusion  pipeline each CPU expert's complete FFN and demand reads\n"
         "      --gpu-safety-mb N   retain at least N MiB of dedicated VRAM (min 128, default 768)\n"
         "      --gpu-expert-no-promote  keep the VRAM pool empty for an all-miss correctness probe\n"
         "      --gpu-expert-window N  admit an expert reused within N decode tokens (default 8)\n"
         "      --no-kv-offload     keep KV and KQV operations on CPU\n"
         "      --elastic-kv        opt-in: grow physical GPU KV capacity in 32K-token chunks\n"
+        "      --gpu-expert-performance-floor-mb N  runtime cache floor during elastic KV growth (default 1024)\n"
         "      --cache-type-k T    KV key cache: f16 (default) | q8_0 | q4_0\n"
         "      --cache-type-v T    KV value cache: f16 (default) | q8_0 | q4_0\n"
         "      --flash-attn M      auto (default) | on | off\n"
@@ -584,10 +641,12 @@ static void print_usage(const char * argv0) {
         "                          no compute, no memory and no expert read, works on any model,\n"
         "                          and drafts NOTHING when it has no confident match — so a step\n"
         "                          without one costs exactly a plain decode\n"
-        "      --draft N           tokens drafted per verify batch (default 3, max %d)\n"
+        "      --draft N           maximum tokens drafted per verify batch (default 3, max %d)\n"
+        "      --mtp-fixed-draft   disable adaptive MTP width; always request --draft tokens\n"
+        "      --mtp-cost-explore  price draft/verify/catch-up and periodically refresh wider widths\n"
         "      --mtp-p-min F       --mtp only: stop drafting when the head's best candidate falls\n"
-        "                          below this probability (0..1, default 0 = draft the full width\n"
-        "                          however unsure it is). Makes the draft width adaptive per step:\n"
+        "                          below this probability (0..1, default 0). The acceptance-history\n"
+        "                          controller also adapts width unless --mtp-fixed-draft is set:\n"
         "                          a draft not made is one fewer MTP-block pass AND one fewer\n"
         "                          independently routed position in the verify batch\n"
         "      --ngram-min-match N --ngram only: shortest run of matching tokens allowed to draft\n"
@@ -625,6 +684,8 @@ static void print_usage(const char * argv0) {
         "      --load-all          debug: read ALL experts each token (A/B baseline)\n"
         "      --force-cache       allow a cache-mb in the pathological band\n"
         "      --overlap           overlap async expert reads with FFN compute (needs the fork)\n"
+        "      --async-expert-io   Windows IOCP expert reads, up to --io-threads in flight;\n"
+        "                          uses buffered I/O (experimental, requires --overlap)\n"
         "      --io-two-wave       publish a layer's first-projection reads before committing the\n"
         "                          rest, so the lanes start sooner (needs --overlap and the cache;\n"
         "                          experimental, off by default pending the on-device A/B)\n"
@@ -821,10 +882,33 @@ int main(int argc, char ** argv) {
             cfg.gpu.main_gpu = gpu_int(a.c_str());
         else if (a == "--gpu-expert-cache-mb")
             cfg.gpu.expert_cache_mb = gpu_int(a.c_str());
-        else if (a == "--expert-access-trace")
+        else if (a == "--gpu-expert-cache-auto")
+            cfg.gpu.expert_cache_auto = true;
+        else if (a == "--gpu-expert-overlap")
+            cfg.gpu.expert_overlap = true;
+        else if (a == "--gpu-expert-miss-mode") {
+            const std::string mode = next(a.c_str());
+            if (mode == "cpu")
+                cfg.gpu.expert_miss_mode = bmoe::RunConfig::GpuConfig::ExpertMissMode::Cpu;
+            else if (mode == "upload")
+                cfg.gpu.expert_miss_mode = bmoe::RunConfig::GpuConfig::ExpertMissMode::Upload;
+            else if (mode == "hybrid" || mode == "auto")
+                cfg.gpu.expert_miss_mode = bmoe::RunConfig::GpuConfig::ExpertMissMode::Hybrid;
+            else if (mode == "direct-host")
+                cfg.gpu.expert_miss_mode = bmoe::RunConfig::GpuConfig::ExpertMissMode::DirectHost;
+            else {
+                std::fprintf(stderr,
+                             "bmoe: --gpu-expert-miss-mode expects cpu, upload, hybrid, auto, or direct-host\n");
+                return 2;
+            }
+        } else if (a == "--expert-access-trace")
             cfg.moe.access_trace_path = next(a.c_str());
         else if (a == "--io-coalesce")
             cfg.moe.io_coalesce = true;
+        else if (a == "--cpu-expert-fusion")
+            cfg.moe.cpu_expert_fusion = true;
+        else if (a == "--async-expert-io")
+            cfg.moe.async_expert_io = true;
         else if (a == "--gpu-safety-mb")
             cfg.gpu.safety_mb = gpu_int(a.c_str());
         else if (a == "--gpu-expert-no-promote")
@@ -844,6 +928,8 @@ int main(int argc, char ** argv) {
             cfg.gpu.kv_offload = false;
         else if (a == "--elastic-kv")
             cfg.gpu.elastic_kv = true;
+        else if (a == "--gpu-expert-performance-floor-mb")
+            cfg.gpu.expert_performance_floor_mb = gpu_int(a.c_str());
         else if (a == "--cache-type-k" || a == "--cache-type-v") {
             const char * value = next(a.c_str());
             RunConfig::GpuConfig::KvCacheType type;
@@ -893,6 +979,10 @@ int main(int argc, char ** argv) {
             cfg.spec.source = want;
         } else if (a == "--draft")
             cfg.spec.draft_max = std::atoi(next("--draft"));
+        else if (a == "--mtp-fixed-draft")
+            cfg.spec.adaptive_mtp = false;
+        else if (a == "--mtp-cost-explore")
+            cfg.spec.mtp_cost_explore = true;
         else if (a == "--mtp-p-min")
             cfg.spec.draft_p_min = (float) std::atof(next("--mtp-p-min"));
         else if (a == "--ngram-min-match")

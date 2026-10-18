@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace bmoe {
 
@@ -23,9 +24,22 @@ class IIoTraceSink;
 
 struct RunResult {
     bool ok = false;
-    bool cancelled = false; // generation was interrupted by Session::cancel() (ok stays true)
+    bool cancelled = false;        // generation was interrupted by Session::cancel() (ok stays true)
+    bool context_pressure = false; // physical KV growth needs conversation compaction
+    int required_kv_tokens = 0;
+    int current_kv_tokens = 0;
+    int expert_floor_mb = 0;
+    int expert_cache_mb = 0;
     std::string error;
     std::string generated_text;
+    std::string raw_generated_text; // structured-chat diagnostics when parsing loses an incomplete call
+    struct ToolCall {
+        std::string name;
+        std::string arguments;
+        std::string id;
+    };
+    std::vector<ToolCall> tool_calls;
+    std::string stop_reason;
     // The reasoning span, when a thinking model's chat template separated it from the answer.
     // Empty otherwise (chat off, non-reasoning model, harmony no-think). Display-only; the answer
     // in generated_text already has it stripped. See TokenMetrics::reasoning.

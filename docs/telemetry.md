@@ -560,6 +560,9 @@ Requests (stdin):
 ```
 {"cmd":"generate","id":<int>,"prompt":"<string>","n_predict":<int>,"think":<bool>,"clear_kv":<bool>,
  "claude_prefix":"<optional stable beginning of prompt>","claude_prewarm":<bool>}
+{"cmd":"generate","id":<int>,"messages":[<OpenAI-compatible chat messages>],
+ "tools":[<OpenAI-compatible function tools>],"tool_choice":"auto|required|none",
+ "parallel_tool_calls":<bool>,"n_predict":<int>,"think":<bool>,"clear_kv":<bool>}
 {"cmd":"decide","id":<int>,"prefix":"<string>","suffix":"<string>","choices":["<string>",...],
  "reuse_prefix":<bool>}   # needs --decide; always rendered with reasoning off; see decide.md
 {"cmd":"cancel"}          # interrupt the in-flight generation; the session stays loaded
@@ -576,12 +579,18 @@ beginning of `prompt` and is tokenized through the same chat template before a
 separate stable checkpoint is captured. See [claude-prefix-cache.md](claude-prefix-cache.md).
 `claude_prewarm:true` (default false) suppresses rolling checkpoint use and
 capture for a zero-output startup prewarm, leaving conversation state intact.
+With `--chatml`, the structured `messages` form uses the model's embedded chat template
+through llama.cpp common chat. It accepts assistant `tool_calls` and subsequent `tool`
+messages with matching `tool_call_id`; tool definitions use the OpenAI function schema.
+The model selects call names and arguments. This form returns parsed calls in `BMOE_DONE`.
+The original `prompt` form and its prefix checkpoint remain available.
 
 Responses (stdout):
 
 ```
 BMOE_READY {"load_s":<float>,"arch":"<string>","n_ctx":<int>,
-            "think_ctl":"template|prefill|none","n_expert_used":<int>}  # once, after the model loads
+            "think_ctl":"template|prefill|none","n_expert_used":<int>,
+            "capabilities":{"structured_chat":true}}  # once, after the model loads
 BMOE_BEGIN {"id":<int>}                                                # a generation started
 BMOE_LOAD / BMOE_PROGRESS ...                                          # per token, as above
 BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
@@ -599,7 +608,13 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "prefill_dev_stall_s":<float>,
             "token_demand_mib":<float>,"mtp_drafted":<int>,"mtp_accepted":<int>,"mtp_decodes":<int>,
             "mtp_draft_s_tok":<float>,"drafted_steps":<int>,"loop_overhead_s_tok":<float>,
-            "reasoning":"<string>","text":"<string>"}
+            "reasoning":"<string>","text":"<string>","raw":"<structured raw output or empty>",
+            "structured_chat":<bool>,
+            "tool_calls":[{"name":"<string>","arguments":"<JSON string>","id":"<string>"},...],
+            "stop_reason":"end_turn|length|cancelled",
+            "target_kv_bytes":<int>,"target_kv_tokens":<int>,
+            "draft_kv_bytes":<int>,"draft_kv_tokens":<int>,
+            "gpu_expert_cache_bytes":<int>,"expert_floor_mb":<int>}
 BMOE_DECIDE {"id":<int>,"cancelled":<bool>,"best":<int>,"choice_logp":[<float|null>,...],
              "n_tokens":<int>,"n_reused":<int>,"n_prefilled":<int>,"restore_s":<float>,
              "store_s":<float>,"prefill_s":<float>,"prefill_cpu_s":<float>,"prefill_read_mib":<float>,
@@ -607,6 +622,9 @@ BMOE_DECIDE {"id":<int>,"cancelled":<bool>,"best":<int>,"choice_logp":[<float|nu
              "prefill_dev_tokens":<int>,"prefill_dev_read_mib":<float>,"prefill_dev_stall_s":<float>,
              "prefill_dev_routed":<int>,"prefill_dev_demand":<int>,"prefix_state_mib":<float>}
 BMOE_ERROR {"id":<int>,"fatal":<bool>,"msg":"<string>"}
+BMOE_ERROR {"id":<int>,"fatal":false,"code":"context_pressure",
+            "required_kv_tokens":<int>,"current_kv_tokens":<int>,
+            "expert_floor_mb":<int>,"expert_cache_mb":<int>,"msg":"<string>"}
 ```
 
 A `decide` request is answered by `BMOE_BEGIN` and then one `BMOE_DECIDE` line, with no per-token
@@ -683,6 +701,11 @@ cache-management cost. `text` is the final answer and `reasoning` the final thin
 unless the model reasoned), same split as the per-token lines. `BMOE_ERROR` with `fatal:false` is a rejected
 request (e.g. the prompt plus `n_predict` exceeds `n_ctx`) and leaves the session usable;
 `fatal:true` means the process is ending.
+`context_pressure` leaves the session usable. It reports the next rounded physical
+KV capacity required and the current capacity; the caller should reduce active
+conversation history, clear KV, and retry. The expert fields report the effective
+performance floor and current pool capacity in MiB. `BMOE_DONE` reports physical
+target and MTP draft KV allocation separately; draft values are zero without MTP.
 
 ## Decode traces
 

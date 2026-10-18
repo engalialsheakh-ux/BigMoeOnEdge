@@ -107,6 +107,9 @@ public:
                          int expert,
                          const void * bytes[MoeRecipe::max_exps],
                          size_t sizes[MoeRecipe::max_exps]) const;
+    // Wait for every projection after an overlap load when a GPU host node
+    // consumes the routed bundle instead of the CPU matmul hook.
+    bool wait_resident_bundle(int il, int expert);
     uint64_t expert_bytes(int il) const override;
     Stats stats() const override;
 
@@ -381,6 +384,12 @@ private:
 
     // I/O lane pool
     int io_threads_ = 1;
+    bool async_expert_io_ = false;
+    bool cpu_expert_fusion_ = false;
+    std::atomic<int> async_inflight_{0};
+    std::atomic<int> async_high_water_{0};
+    std::atomic<uint64_t> async_read_requests_{0};
+    std::atomic<uint64_t> async_overlap_completions_{0};
     std::vector<std::thread> io_pool_;
     std::vector<IoJob> jobs_;
     std::mutex io_mtx_;

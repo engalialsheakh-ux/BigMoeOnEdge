@@ -7,7 +7,11 @@
 #include <string>
 
 int main(int argc, char ** argv) {
-    if (argc < 2 || argc > 5) return 2;
+    if (argc < 2 || argc > 6) return 2;
+    const bool upload_gate = argc == 6 && std::string(argv[5]) == "upload";
+    const bool hybrid_gate = argc == 6 && std::string(argv[5]) == "hybrid";
+    const bool branch_overlap_gate = argc == 6 && std::string(argv[5]) == "overlap";
+    if (argc == 6 && !upload_gate && !hybrid_gate && !branch_overlap_gate) return 2;
 
     llama_backend_init();
     bool gpu_available = false;
@@ -34,6 +38,8 @@ int main(int argc, char ** argv) {
     streamed.moe.io_threads = 2;
     streamed.moe.dense_weights = bmoe::DenseWeightsMode::Anonymous;
     if (argc >= 3) streamed.moe.cache_mb = std::stoi(argv[2]);
+    if (upload_gate || hybrid_gate || branch_overlap_gate) streamed.moe.force_cache = true;
+    streamed.gpu.expert_overlap = branch_overlap_gate;
     if (argc >= 5) streamed.gpu.expert_cache_mb = std::stoi(argv[4]);
     // Keep the byte-identity gate all-miss; mixed CPU/CUDA arithmetic has a
     // separate numerical gate and real-model smoke test.
@@ -48,6 +54,22 @@ int main(int argc, char ** argv) {
     if (!reference) {
         std::fprintf(stderr, "hybrid resident run failed: %s\n", reference.error.c_str());
         return 1;
+    }
+    if (upload_gate || hybrid_gate) {
+        bmoe::RunConfig upload = streamed;
+        upload.moe.overlap = true;
+        upload.gpu.expert_miss_mode = upload_gate ? bmoe::RunConfig::GpuConfig::ExpertMissMode::Upload
+                                                  : bmoe::RunConfig::GpuConfig::ExpertMissMode::Hybrid;
+        const bmoe::RunResult gpu_misses = bmoe::run(upload);
+        if (!gpu_misses || (upload_gate && gpu_misses.generated_text != reference.generated_text) ||
+            (hybrid_gate && gpu_misses.summary.moe_read_mib <= 0.0)) {
+            std::fprintf(stderr, "GPU miss execution failed: %s; reference='%s'; actual='%s'\n",
+                         gpu_misses.error.c_str(), reference.generated_text.c_str(), gpu_misses.generated_text.c_str());
+            return 1;
+        }
+        std::puts(upload_gate ? "GPU upload decode matches resident GPU output"
+                              : "hybrid CPU/GPU miss decode completed with exact expert weights");
+        return 0;
     }
     const bmoe::RunResult serial = bmoe::run(streamed);
     if (!serial || serial.generated_text != reference.generated_text || serial.summary.moe_read_mib <= 0.0) {
@@ -92,6 +114,7 @@ int main(int argc, char ** argv) {
     bmoe::RunConfig partial = streamed;
     partial.gpu.n_gpu_layers = 1;
     partial.gpu.expert_cache_mb = 0;
+    partial.gpu.expert_overlap = false;
     partial.moe.release_mmap = true;
     partial.moe.require_release_mmap = true;
     const bmoe::RunResult unsafe_release = bmoe::run(partial);

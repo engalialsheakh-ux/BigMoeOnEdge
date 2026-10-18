@@ -44,9 +44,10 @@ int main() {
 
     constexpr int n_expert = 3;
     constexpr int n_used = 2;
+    constexpr int n_tokens = 2;
     constexpr int n_embd = 4;
     constexpr int n_ff = 3;
-    const std::array<int32_t, n_used> selected{2, 0};
+    const std::array<int32_t, n_used * n_tokens> selected{2, 0, 0, 2};
     bmoe::LayerExperts layer;
     layer.bound = true;
     std::array<std::vector<float>, 3> values;
@@ -89,8 +90,8 @@ int main() {
     ggml_tensor * device_map = pool.make_device_table(gpu_ctx.get(), 0);
     if (!cached[0] || !cached[1] || !cached[2] || !host_map || !device_map) return 1;
 
-    ggml_tensor * cpu_input = ggml_new_tensor_3d(cpu_ctx.get(), GGML_TYPE_F32, n_embd, 1, 1);
-    ggml_tensor * cpu_ids = ggml_new_tensor_2d(cpu_ctx.get(), GGML_TYPE_I32, n_used, 1);
+    ggml_tensor * cpu_input = ggml_new_tensor_3d(cpu_ctx.get(), GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * cpu_ids = ggml_new_tensor_2d(cpu_ctx.get(), GGML_TYPE_I32, n_used, n_tokens);
     auto cpu_layer = [&](bool skip) {
         ggml_tensor * up = ggml_mul_mat_id(cpu_ctx.get(), cpu_bank[1], cpu_input, cpu_ids);
         ggml_tensor * gate = ggml_mul_mat_id(cpu_ctx.get(), cpu_bank[0], cpu_input, cpu_ids);
@@ -115,10 +116,12 @@ int main() {
         ggml_backend_alloc_ctx_tensors(cpu_ctx.get(), cpu.get()), ggml_backend_buffer_free);
     if (!cpu_buffer) return 1;
 
-    ggml_tensor * gpu_input = ggml_new_tensor_3d(gpu_ctx.get(), GGML_TYPE_F32, n_embd, 1, 1);
-    ggml_tensor * gpu_ids = ggml_new_tensor_2d(gpu_ctx.get(), GGML_TYPE_I32, n_used, 1);
-    ggml_tensor * slot_ids = ggml_get_rows(gpu_ctx.get(), device_map, gpu_ids);
-    slot_ids = ggml_reshape_2d(gpu_ctx.get(), slot_ids, n_used, 1);
+    ggml_tensor * gpu_input = ggml_new_tensor_3d(gpu_ctx.get(), GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * gpu_ids = ggml_new_tensor_2d(gpu_ctx.get(), GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * repeated_map =
+        ggml_view_3d(gpu_ctx.get(), device_map, 1, n_expert, n_tokens, device_map->nb[1], device_map->nb[2], 0);
+    ggml_tensor * slot_ids = ggml_get_rows(gpu_ctx.get(), repeated_map, gpu_ids);
+    slot_ids = ggml_reshape_2d(gpu_ctx.get(), slot_ids, n_used, n_tokens);
     auto gpu_layer = [&](const std::array<ggml_tensor *, 3> & bank, ggml_tensor * ids) {
         ggml_tensor * up = ggml_mul_mat_id(gpu_ctx.get(), bank[1], gpu_input, ids);
         ggml_tensor * gate = ggml_mul_mat_id(gpu_ctx.get(), bank[0], gpu_input, ids);
@@ -139,14 +142,14 @@ int main() {
         ggml_backend_tensor_set(cpu_bank[p], values[p].data(), 0, values[p].size() * sizeof(float));
         ggml_backend_tensor_set(gpu_bank[p], values[p].data(), 0, values[p].size() * sizeof(float));
     }
-    const std::array<float, n_embd> input{0.2f, 0.7f, -0.4f, 1.1f};
+    const std::array<float, n_embd * n_tokens> input{0.2f, 0.7f, -0.4f, 1.1f, -0.3f, 0.8f, 0.5f, -0.6f};
     ggml_backend_tensor_set(cpu_input, input.data(), 0, sizeof(input));
     ggml_backend_tensor_set(gpu_input, input.data(), 0, sizeof(input));
     ggml_backend_tensor_set(cpu_ids, selected.data(), 0, sizeof(selected));
     ggml_backend_tensor_set(gpu_ids, selected.data(), 0, sizeof(selected));
     if (ggml_backend_graph_compute(cpu.get(), cpu_reference_graph) != GGML_STATUS_SUCCESS) return 1;
     if (ggml_backend_graph_compute(gpu.get(), gpu_reference_graph) != GGML_STATUS_SUCCESS) return 1;
-    std::array<float, n_embd * n_used> cpu_want{}, gpu_want{};
+    std::array<float, n_embd * n_used * n_tokens> cpu_want{}, gpu_want{};
     ggml_backend_tensor_get(cpu_reference, cpu_want.data(), 0, sizeof(cpu_want));
     ggml_backend_tensor_get(gpu_reference, gpu_want.data(), 0, sizeof(gpu_want));
     float cpu_gpu_delta = 0.0f;
@@ -177,12 +180,13 @@ int main() {
         ggml_cpu_set_expert_ready_hook(nullptr, nullptr);
         if (cpu_status != GGML_STATUS_SUCCESS) return false;
         if (ggml_backend_graph_compute(gpu.get(), gpu_masked_graph) != GGML_STATUS_SUCCESS) return false;
-        std::array<float, 8> cpu_rows{}, gpu_rows{};
-        ggml_backend_tensor_get(cpu_masked, cpu_rows.data(), 0, sizeof(cpu_rows));
-        ggml_backend_tensor_get(gpu_masked, gpu_rows.data(), 0, sizeof(gpu_rows));
-        for (int route = 0; route < n_used; ++route) {
-            const bool hit = route == 0 ? hit_first : hit_second;
+        std::vector<float> cpu_rows(size_t(n_embd * n_used * n_tokens));
+        std::vector<float> gpu_rows(size_t(n_embd * n_used * n_tokens));
+        ggml_backend_tensor_get(cpu_masked, cpu_rows.data(), 0, cpu_rows.size() * sizeof(float));
+        ggml_backend_tensor_get(gpu_masked, gpu_rows.data(), 0, gpu_rows.size() * sizeof(float));
+        for (int route = 0; route < n_used * n_tokens; ++route) {
             const int expert = selected[size_t(route)];
+            const bool hit = expert == selected[0] ? hit_first : hit_second;
             const int calls = ready_calls[size_t(expert)].load();
             if ((hit && calls != 0) || (!hit && calls == 0)) {
                 std::fprintf(stderr, "%s: expert-ready count wrong for %d: %d\n", name, expert, calls);

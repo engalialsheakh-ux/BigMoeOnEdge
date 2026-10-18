@@ -51,8 +51,9 @@ bool fd_ok(fd_t fd) {
     return fd != (void *) INVALID_HANDLE_VALUE;
 }
 
-fd_t open_read(const char * path, bool direct, bool * effective_direct) {
-    DWORD flags = FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+fd_t open_read(const char * path, bool direct, bool * effective_direct, bool asynchronous) {
+    DWORD flags =
+        FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING : 0) | (asynchronous ? FILE_FLAG_OVERLAPPED : 0);
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
     if (effective_direct) *effective_direct = direct && fd_ok((fd_t) h);
     return (fd_t) h;
@@ -75,6 +76,27 @@ long long pread_at(fd_t fd, void * buf, size_t count, uint64_t off) {
         return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
     }
     return (long long) got;
+}
+
+void * make_completion_port(fd_t fd) {
+    return CreateIoCompletionPort((HANDLE) fd, nullptr, 0, 1);
+}
+
+long long pread_at_iocp(fd_t fd, void * port, void * buf, size_t count, uint64_t off) {
+    OVERLAPPED ov{};
+    ov.Offset = DWORD(off & 0xFFFFFFFFull);
+    ov.OffsetHigh = DWORD(off >> 32);
+    const DWORD to_read = count > 0x40000000ull ? 0x40000000ul : DWORD(count);
+    if (!ReadFile((HANDLE) fd, buf, to_read, nullptr, &ov)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_HANDLE_EOF) return 0;
+        if (error != ERROR_IO_PENDING) return -1;
+    }
+    DWORD got = 0;
+    ULONG_PTR key = 0;
+    LPOVERLAPPED completed = nullptr;
+    if (!GetQueuedCompletionStatus((HANDLE) port, &got, &key, &completed, INFINITE) || completed != &ov) return -1;
+    return got;
 }
 
 uint64_t file_size(fd_t fd) {
@@ -172,7 +194,7 @@ bool fd_ok(fd_t fd) {
     return fd >= 0;
 }
 
-fd_t open_read(const char * path, bool direct, bool * effective_direct) {
+fd_t open_read(const char * path, bool direct, bool * effective_direct, bool /*asynchronous*/) {
 #if defined(__APPLE__)
     // No O_DIRECT here (the shim above leaves it 0), so a direct request is an ordinary open plus
     // F_NOCACHE: ask the kernel not to keep this descriptor's pages. That is the whole of Apple's

@@ -12,6 +12,11 @@ add_executable(bmoe_io_coalesce_test io_coalesce_test.cpp)
 target_link_libraries(bmoe_io_coalesce_test PRIVATE bmoe_core)
 target_include_directories(bmoe_io_coalesce_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe ${CMAKE_SOURCE_DIR}/core/src/io)
 add_test(NAME io_coalesce COMMAND bmoe_io_coalesce_test)
+add_executable(bmoe_async_file_reader_test async_file_reader_test.cpp)
+target_link_libraries(bmoe_async_file_reader_test PRIVATE bmoe_core)
+target_include_directories(bmoe_async_file_reader_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/io)
+add_test(NAME async_file_reader COMMAND bmoe_async_file_reader_test)
+set_tests_properties(async_file_reader PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(bmoe_prefill_cache_gate prefill_cache_gate.cpp)
 target_link_libraries(bmoe_prefill_cache_gate PRIVATE bmoe_core)
 add_executable(bmoe_hybrid_gpu_gate hybrid_gpu_gate.cpp)
@@ -24,6 +29,18 @@ add_executable(bmoe_gpu_expert_pool_test gpu_expert_pool_test.cpp)
 target_link_libraries(bmoe_gpu_expert_pool_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME gpu_expert_pool COMMAND bmoe_gpu_expert_pool_test)
+add_executable(bmoe_adaptive_mtp_test adaptive_mtp_test.cpp)
+target_include_directories(bmoe_adaptive_mtp_test PRIVATE ${CMAKE_SOURCE_DIR}/core/include)
+add_test(NAME adaptive_mtp COMMAND bmoe_adaptive_mtp_test)
+add_executable(bmoe_hybrid_miss_test hybrid_miss_test.cpp)
+target_include_directories(bmoe_hybrid_miss_test PRIVATE ${CMAKE_SOURCE_DIR}/core/include)
+add_test(NAME hybrid_miss COMMAND bmoe_hybrid_miss_test)
+add_executable(bmoe_cpu_expert_schedule_test cpu_expert_schedule_test.cpp)
+target_link_libraries(bmoe_cpu_expert_schedule_test PRIVATE bmoe_core)
+add_test(NAME cpu_expert_schedule COMMAND bmoe_cpu_expert_schedule_test)
+add_executable(bmoe_cpu_expert_fusion_test cpu_expert_fusion_test.cpp)
+target_link_libraries(bmoe_cpu_expert_fusion_test PRIVATE bmoe_core)
+add_test(NAME cpu_expert_fusion COMMAND bmoe_cpu_expert_fusion_test)
 set_tests_properties(gpu_expert_pool PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
 add_executable(bmoe_gpu_agent_state_gate gpu_agent_state_gate.cpp)
 target_link_libraries(bmoe_gpu_agent_state_gate PRIVATE bmoe_core)
@@ -39,6 +56,12 @@ target_link_libraries(bmoe_gpu_expert_moe_layer_test PRIVATE bmoe_core)
 target_include_directories(bmoe_gpu_expert_moe_layer_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
 add_test(NAME gpu_expert_moe_layer COMMAND bmoe_gpu_expert_moe_layer_test)
 set_tests_properties(gpu_expert_moe_layer PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+
+add_executable(bmoe_gpu_expert_lru_test gpu_expert_lru_test.cpp)
+target_link_libraries(bmoe_gpu_expert_lru_test PRIVATE bmoe_core)
+target_include_directories(bmoe_gpu_expert_lru_test PRIVATE ${CMAKE_SOURCE_DIR}/core/src/moe)
+add_test(NAME gpu_expert_lru COMMAND bmoe_gpu_expert_lru_test)
+set_tests_properties(gpu_expert_lru PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
 add_executable(bmoe_cpu_expert_skip_test cpu_expert_skip_test.cpp)
 target_link_libraries(bmoe_cpu_expert_skip_test PRIVATE bmoe_core)
 add_test(NAME cpu_expert_skip COMMAND bmoe_cpu_expert_skip_test)
@@ -133,8 +156,9 @@ foreach(_test_target IN ITEMS
         bmoe_moe_gates bmoe_hybrid_gpu_gate bmoe_hybrid_prefill_gate bmoe_layer_tile_gate bmoe_prefill_cache_gate
         bmoe_gpu_expert_pool_test bmoe_gpu_expert_matmul_test
         bmoe_gpu_agent_state_gate bmoe_elastic_kv_gate
-        bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test
-        bmoe_cpu_expert_skip_test
+        bmoe_gpu_expert_moe_layer_test bmoe_gpu_expert_mixed_test bmoe_gpu_expert_lru_test
+        bmoe_cpu_expert_skip_test bmoe_cpu_expert_schedule_test bmoe_cpu_expert_fusion_test
+        bmoe_async_file_reader_test
         bmoe_chat_parse_test bmoe_think_control_test
         bmoe_config_test bmoe_mapping_release_test bmoe_ngram_test bmoe_stall_union_test
         bmoe_csv_summary_test bmoe_decide_test bmoe_io_coalesce_test)
@@ -166,6 +190,8 @@ add_test(NAME gpu_agent_state_gate COMMAND bmoe_gpu_agent_state_gate ${_layer_ti
 set_tests_properties(gpu_agent_state_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu)
 add_test(NAME elastic_kv_gate COMMAND bmoe_elastic_kv_gate ${_layer_tile_model})
 set_tests_properties(elastic_kv_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu)
+add_test(NAME elastic_kv_rebalance_gate COMMAND bmoe_elastic_kv_gate ${_layer_tile_model} rebalance)
+set_tests_properties(elastic_kv_rebalance_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu RESOURCE_LOCK gpu)
 
 set(_prefill_cache_model "${CMAKE_CURRENT_BINARY_DIR}/tiny-moe-prefill-cache.gguf")
 add_test(NAME moe_make_tiny_model_prefill_cache
@@ -213,6 +239,12 @@ foreach(spec "qwen3moe" "gemma4" "nemotron_h_moe")
     if(spec STREQUAL "qwen3moe")
         add_test(NAME hybrid_gpu_gate COMMAND bmoe_hybrid_gpu_gate ${_model})
         set_tests_properties(hybrid_gpu_gate PROPERTIES FIXTURES_REQUIRED ${_fixture} SKIP_RETURN_CODE 77)
+        add_test(NAME hybrid_gpu_upload_gate COMMAND bmoe_hybrid_gpu_gate ${_model} 2 kv-gpu 64 upload)
+        set_tests_properties(hybrid_gpu_upload_gate PROPERTIES FIXTURES_REQUIRED ${_fixture} SKIP_RETURN_CODE 77 LABELS gpu)
+        add_test(NAME hybrid_gpu_miss_gate COMMAND bmoe_hybrid_gpu_gate ${_model} 2 kv-gpu 64 hybrid)
+        set_tests_properties(hybrid_gpu_miss_gate PROPERTIES FIXTURES_REQUIRED ${_fixture} SKIP_RETURN_CODE 77 LABELS gpu)
+        add_test(NAME hybrid_gpu_branch_overlap_gate COMMAND bmoe_hybrid_gpu_gate ${_model} 2 kv-gpu 64 overlap)
+        set_tests_properties(hybrid_gpu_branch_overlap_gate PROPERTIES FIXTURES_REQUIRED ${_fixture} SKIP_RETURN_CODE 77 LABELS gpu)
     endif()
 endforeach()
 

@@ -135,13 +135,24 @@ public:
     } // non-null → stream mode
 
     void set_gpu_expert_pool(GpuExpertPool * pool);
+    using HybridUploadFn = bool (*)(void *, int, const std::vector<int32_t> &, std::vector<int32_t> &);
+    void set_hybrid_upload(HybridUploadFn fn, void * user_data) {
+        hybrid_upload_ = fn;
+        hybrid_upload_user_data_ = user_data;
+    }
+    void set_gpu_owned_mode(bool enabled) { gpu_owned_mode_ = enabled; }
     // A fresh independent replay must rediscover the first graph's cache branch.
     void reset_gpu_graph_discovery();
     void begin_gpu_decode();
     void finish_gpu_decode();
+    bool gpu_pool_idle() const { return gpu_pins_.empty(); }
     const std::vector<std::pair<int, int>> & gpu_misses() const { return gpu_misses_; }
     uint64_t gpu_hits() const { return gpu_hits_; }
     uint64_t gpu_cpu_misses() const { return gpu_cpu_misses_; }
+    uint64_t gpu_hybrid_misses() const { return gpu_hybrid_misses_; }
+    uint64_t gpu_grouped_layers() const { return gpu_grouped_layers_; }
+    uint64_t gpu_grouped_contributions() const { return gpu_grouped_contributions_; }
+    uint64_t gpu_grouped_fallbacks() const { return gpu_grouped_fallbacks_; }
 
     // Install the row-gathered residency policy (see bmoe/row_source.h). Non-null makes the stream
     // pass check every gather node against it and make the rows present before the node runs.
@@ -547,6 +558,9 @@ private:
     bool drop_prefill_ = false;
     int batch_phase_ = 1; // 0 prefill, 1 decode
     GpuExpertPool * gpu_pool_ = nullptr;
+    HybridUploadFn hybrid_upload_ = nullptr;
+    void * hybrid_upload_user_data_ = nullptr;
+    bool gpu_owned_mode_ = false;
     std::vector<GpuExpertPool::Lease> gpu_pins_;
     std::vector<std::pair<int, int>> gpu_misses_;
     std::vector<int32_t> gpu_slots_;
@@ -555,6 +569,10 @@ private:
     std::vector<uint8_t> gpu_mapped_layers_;
     uint64_t gpu_hits_ = 0;
     uint64_t gpu_cpu_misses_ = 0;
+    uint64_t gpu_hybrid_misses_ = 0;
+    uint64_t gpu_grouped_layers_ = 0;
+    uint64_t gpu_grouped_contributions_ = 0;
+    uint64_t gpu_grouped_fallbacks_ = 0;
     bool gpu_unsupported_logged_ = false;
     long long experts_routed_ = 0, experts_dropped_ = 0;
     bool count_device_nodes_ = false;

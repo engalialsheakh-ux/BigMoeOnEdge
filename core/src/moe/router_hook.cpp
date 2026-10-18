@@ -24,7 +24,15 @@ RouterHook::RouterHook(const MoeRecipe & recipe, int n_layer) : recipe_(recipe),
 
 void RouterHook::set_gpu_expert_pool(GpuExpertPool * pool) {
     gpu_pool_ = pool;
-    if (!pool) return;
+    if (!pool) {
+        gpu_pins_.clear();
+        gpu_misses_.clear();
+        gpu_slots_.clear();
+        gpu_graph_layers_.clear();
+        gpu_mapped_layers_.clear();
+        gpu_owned_mode_ = false;
+        return;
+    }
     gpu_slots_.assign(size_t(pool->expert_count()), 0);
     gpu_graph_layers_.assign(pool->layers().size(), 0);
     gpu_mapped_layers_.assign(pool->layers().size(), 0);
@@ -36,6 +44,7 @@ void RouterHook::reset_gpu_graph_discovery() {
 
 void RouterHook::begin_gpu_decode() {
     if (!gpu_pool_) return;
+    if (gpu_owned_mode_) return;
     if (!gpu_pins_.empty()) {
         std::fprintf(stderr, "bmoe: GPU expert cache pin survived the previous decode\n");
         std::abort();
@@ -48,6 +57,7 @@ void RouterHook::begin_gpu_decode() {
 
 void RouterHook::finish_gpu_decode() {
     if (!gpu_pool_) return;
+    if (gpu_owned_mode_) return;
     std::fill(gpu_slots_.begin(), gpu_slots_.end(), 0);
     for (size_t il = 0; il < gpu_mapped_layers_.size(); ++il) {
         if (gpu_mapped_layers_[il] && !gpu_pool_->update_mapping(int(il), gpu_slots_.data(), int(gpu_slots_.size()))) {
@@ -1590,7 +1600,7 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
         // as the prefetch does — the isolated variant measured ~+0.04 s/token of pure barrier and
         // GEMV tax on the host. What makes that safe for a COMMITTED consumer is the watchdog in
         // route_ahead_submit plus the passthrough default, not a barrier.
-        return ctrace_iso || is_topk || weights_iso || (is_logits && predict_log_) || probe_ask;
+        return ctrace_iso || (is_topk && !gpu_owned_mode_) || weights_iso || (is_logits && predict_log_) || probe_ask;
     }
 
     // The probe attaches to the gate matmul rather than to the topk node because this is where the
@@ -1666,8 +1676,16 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
                         *(const int32_t *) ((const char *) t->data + (size_t) j * t->nb[1] + (size_t) k * t->nb[0]));
         }
 
-        const bool gpu_mapping = gpu_pool_ && batch_phase_ == 1 && nt == 1 && il >= 0 &&
-                                 size_t(il) < gpu_graph_layers_.size() && gpu_graph_layers_[size_t(il)];
+        bool grouped_shape =
+            nt > 0 && nt <= 16 && nu > 0 && il >= 0 && gpu_pool_ && size_t(il) < gpu_pool_->layers().size();
+        if (grouped_shape) {
+            const auto & layer = gpu_pool_->layers()[size_t(il)];
+            grouped_shape = layer.slot_count > 1;
+            for (const auto & projection : layer.proj)
+                grouped_shape = grouped_shape && projection.shape && projection.expert_bytes > 0;
+        }
+        const bool gpu_mapping = grouped_shape && batch_phase_ == 1 && size_t(il) < gpu_graph_layers_.size() &&
+                                 gpu_graph_layers_[size_t(il)];
         if (gpu_mapping) {
             if (gpu_mapped_layers_[size_t(il)]) {
                 std::fprintf(stderr, "bmoe: GPU expert map changed twice in one decode, layer %d\n", il);
@@ -1687,6 +1705,35 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
                     ++gpu_hits_;
                 } else {
                     gpu_cpu_ids_.push_back(expert);
+                }
+            }
+            if (hybrid_upload_ && !gpu_cpu_ids_.empty()) {
+                std::vector<int32_t> uploaded;
+                if (!hybrid_upload_(hybrid_upload_user_data_, il, gpu_cpu_ids_, uploaded)) {
+                    std::fprintf(stderr, "bmoe: hybrid expert upload failed in layer %d\n", il);
+                    std::abort();
+                }
+                for (int32_t expert : uploaded) {
+                    if (expert < 0 || size_t(expert) >= gpu_slots_.size() || gpu_slots_[size_t(expert)] != 0) {
+                        std::fprintf(stderr, "bmoe: invalid hybrid expert selection in layer %d\n", il);
+                        std::abort();
+                    }
+                    const auto lease = gpu_pool_->pin(il, expert);
+                    if (!lease) {
+                        std::fprintf(stderr, "bmoe: hybrid expert was not published in layer %d\n", il);
+                        std::abort();
+                    }
+                    gpu_slots_[size_t(expert)] = lease.slot;
+                    gpu_pins_.push_back(lease);
+                }
+            }
+            const std::vector<int32_t> pending_cpu = std::move(gpu_cpu_ids_);
+            gpu_cpu_ids_.clear();
+            for (int32_t expert : pending_cpu) {
+                if (gpu_slots_[size_t(expert)] != 0) {
+                    ++gpu_hybrid_misses_;
+                } else {
+                    gpu_cpu_ids_.push_back(expert);
                     gpu_misses_.emplace_back(il, expert);
                     ++gpu_cpu_misses_;
                 }
@@ -1696,11 +1743,19 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
                 std::abort();
             }
             gpu_mapped_layers_[size_t(il)] = 1;
-        } else if (gpu_pool_ && batch_phase_ == 1 && nt == 1 && il >= 0 && size_t(il) < gpu_pool_->layers().size() &&
+            const uint64_t grouped = gathered_.size() - gpu_cpu_ids_.size();
+            if (grouped) {
+                ++gpu_grouped_layers_;
+                gpu_grouped_contributions_ += grouped;
+            } else {
+                ++gpu_grouped_fallbacks_;
+            }
+        } else if (gpu_pool_ && batch_phase_ == 1 && nt > 0 && il >= 0 && size_t(il) < gpu_pool_->layers().size() &&
                    gpu_pool_->layers()[size_t(il)].slot_count) {
             // The first graph reveals its cache branch after top-k. Its routed
             // experts still run on CPU and belong in the miss counter.
             gpu_cpu_misses_ += gathered_.size();
+            ++gpu_grouped_fallbacks_;
         }
 
         if (trace_on_) {

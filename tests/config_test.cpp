@@ -61,6 +61,14 @@ int main() {
         expect_ok("agent state cache with deterministic GPU promotions", c);
         c.gpu.expert_cache_promote = false;
         expect_ok("agent state cache with fixed empty GPU pool", c);
+        c.gpu.expert_miss_mode = RunConfig::GpuConfig::ExpertMissMode::Upload;
+        expect_fail("upload mode needs a RAM expert cache", c);
+        c.moe.cache_mb = 3000;
+        expect_ok("upload mode with RAM and GPU caches", c);
+        c.gpu.expert_miss_mode = RunConfig::GpuConfig::ExpertMissMode::Hybrid;
+        expect_ok("hybrid mode with RAM and GPU caches", c);
+        c.gpu.expert_miss_mode = RunConfig::GpuConfig::ExpertMissMode::DirectHost;
+        expect_fail("direct-host mode is disabled by CUDA backend invariant", c);
     }
     {
         using KvCacheType = RunConfig::GpuConfig::KvCacheType;
@@ -152,6 +160,24 @@ int main() {
         c.gpu.expert_cache_mb = -1;
         expect_fail("negative VRAM expert cache budget", c);
         c.gpu.expert_cache_mb = 0;
+        c.moe.enabled = true;
+        c.gpu.expert_cache_auto = true;
+        expect_ok("automatic VRAM expert cache with full GPU placement", c);
+        c.gpu.expert_overlap = true;
+        expect_ok("CPU/GPU branch overlap with an automatic expert pool", c);
+        c.gpu.expert_miss_mode = RunConfig::GpuConfig::ExpertMissMode::Upload;
+        expect_fail("CPU/GPU branch overlap rejects upload mode", c);
+        c.gpu.expert_miss_mode = RunConfig::GpuConfig::ExpertMissMode::Cpu;
+        c.gpu.expert_cache_auto = false;
+        expect_fail("CPU/GPU branch overlap requires a pool", c);
+        c.gpu.expert_overlap = false;
+        c.gpu.expert_cache_auto = true;
+        c.gpu.expert_cache_mb = 512;
+        expect_fail("automatic VRAM cache conflicts with explicit size", c);
+        c.gpu.expert_cache_mb = 0;
+        c.gpu.n_gpu_layers = 0;
+        expect_fail("automatic VRAM expert cache needs full GPU placement", c);
+        c.gpu.expert_cache_auto = false;
         c.gpu.expert_cache_window = 0;
         expect_fail("zero VRAM admission window", c);
         c.gpu.expert_cache_window = 65;
@@ -474,6 +500,20 @@ int main() {
         expect_ok("the confidence floor is valid for the source that has one", c);
     }
 
+    {
+        RunConfig c = ok_base();
+        if (c.spec.mtp_cost_explore) return 1;
+        c.spec.mtp_cost_explore = true;
+        expect_fail("MTP cost exploration needs the MTP source", c);
+        c.spec.source = DraftSource::mtp;
+        expect_ok("MTP cost exploration with adaptive drafting", c);
+        c.spec.adaptive_mtp = false;
+        expect_fail("MTP cost exploration conflicts with fixed drafting", c);
+        c.spec.adaptive_mtp = true;
+        c.spec.source = DraftSource::ngram;
+        expect_fail("MTP cost exploration is not an n-gram setting", c);
+    }
+
     // The verify batch must fit in one graph, or the amortisation it exists for is split away.
     {
         RunConfig c = ok_base();
@@ -558,6 +598,30 @@ int main() {
         c.moe.enabled = true;
         expect_ok("decide probe on a streamed session", c);
         c.decide = DecideConfig{};
+    }
+
+    {
+        RunConfig c = ok_base();
+        c.moe.async_expert_io = true;
+        expect_fail("IOCP requires streaming and overlap", c);
+        c.moe.enabled = true;
+        expect_fail("IOCP requires overlap", c);
+        c.moe.overlap = true;
+#if defined(_WIN32)
+        expect_ok("IOCP is valid with streamed overlap on Windows", c);
+#else
+        expect_fail("IOCP is Windows-only", c);
+#endif
+    }
+
+    {
+        RunConfig c = ok_base();
+        c.moe.cpu_expert_fusion = true;
+        expect_fail("CPU expert fusion requires streaming", c);
+        c.moe.enabled = true;
+        expect_fail("CPU expert fusion requires overlap", c);
+        c.moe.overlap = true;
+        expect_ok("CPU expert fusion with streamed overlap", c);
     }
 
     if (failures == 0) {

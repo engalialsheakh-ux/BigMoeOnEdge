@@ -41,7 +41,8 @@ public:
     // the platform or the storage refuses or mis-serves it — direct() then reports the effective
     // mode. Reads align to `align` where the platform's direct mode demands it. Returns false on any
     // open/alloc failure.
-    bool open(const std::string & path, int lanes, bool direct, size_t align, size_t bounce_cap);
+    bool
+    open(const std::string & path, int lanes, bool direct, size_t align, size_t bounce_cap, bool asynchronous = false);
     void close();
     // Close every fd and open the same file again with the same lanes, alignment and bounce size.
     // Exists for one reason: on Windows an unbuffered handle opened while the file had a live
@@ -66,12 +67,18 @@ public:
     // Aggregate accounting since open, summed across lanes.
     long long read_bytes() const { return read_bytes_.load(std::memory_order_relaxed); }
     long long syscall_ns() const { return syscall_ns_.load(std::memory_order_relaxed); }
+    long long async_completions() const { return async_completions_.load(std::memory_order_relaxed); }
+    int async_high_water() const { return async_high_water_.load(std::memory_order_relaxed); }
+    bool asynchronous() const { return async_; }
 
 private:
     std::vector<pio::fd_t> fds_;     // primary (cache-bypassing where achieved) per lane
     std::vector<pio::fd_t> fds_buf_; // buffered fallback per lane, for the sub-alignment EOF tail
     std::vector<void *> bounces_;
     std::vector<size_t> bounce_sz_;
+#if defined(_WIN32)
+    std::vector<void *> completion_ports_;
+#endif
     size_t align_ = 4096;
     uint64_t fsize_ = 0;
     bool direct_ = false;        // cache bypass actually in effect for the fds (uncached descriptors),
@@ -83,9 +90,14 @@ private:
     std::string path_;
     int lanes_ = 0;
     bool direct_req_ = false;
+    bool async_req_ = false;
+    bool async_ = false;
     size_t bounce_cap_ = 0;
     std::atomic<long long> read_bytes_{0};
     std::atomic<long long> syscall_ns_{0};
+    std::atomic<long long> async_completions_{0};
+    std::atomic<int> async_inflight_{0};
+    std::atomic<int> async_high_water_{0};
 };
 
 } // namespace bmoe

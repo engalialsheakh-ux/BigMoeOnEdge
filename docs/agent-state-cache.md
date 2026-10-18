@@ -7,10 +7,12 @@ checkpoint and prefills only the remaining suffix. A process restart can reuse t
 same file. The file contains llama.cpp's sequence state and the checkpoint tokens;
 it contains no model weights or expert-cache entries.
 
-The checkpoint is taken at the largest 512-token boundary before the final prompt
+The persistent checkpoint is taken at the largest 512-token boundary before the final prompt
 token for prompts longer than 1024 tokens. Between 129 and 1024 tokens the
-boundary is 64 tokens. There is only one checkpoint in memory and on disk. This
-limits memory use, but a change before the saved boundary causes a cold prefill.
+boundary is 64 tokens. For prompts extending beyond 4096 tokens, the session also keeps
+one in-memory checkpoint at 4096 when the rolling boundary lies later. A change between
+these boundaries reuses the earlier checkpoint; a change before both runs a cold prefill.
+Only the rolling checkpoint survives a process restart.
 For multi-turn chat, ordinary live-context continuation still applies when
 `clear_kv=false`; this file is used automatically for fresh requests.
 
@@ -43,7 +45,10 @@ all-miss control. The deterministic mode retains the full configured GPU pool
 and exact model top-k; its transfers can add a small token-boundary wait.
 
 The checkpoint captures both attention KV and recurrent/SSM state through
-llama.cpp's public sequence-state API. A focused gate mutates the state, restores
+llama.cpp's public sequence-state API. With MTP, it also captures the draft context's
+sequence state and the driver's carried hidden row. MTP snapshot files use `BMOEAS03`;
+older draft snapshots are rejected and rebuilt because they lack the driver row.
+A focused gate mutates the state, restores
 it twice, checks recurrent-state bytes, and compares subsequent logits. The
 integration gate checks in-process reuse, restart reuse, a changed prefix,
 an incompatible execution setting, and a corrupt file. Creating a checkpoint

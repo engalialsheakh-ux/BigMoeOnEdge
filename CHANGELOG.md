@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.37.0] - 2026-10-17
+
+### Added
+- Keep Elastic KV growth above a configurable GPU expert performance floor (default 1024 MiB,
+  capped by the configured cache target and raised to the pool's technical minimum). Report
+  recoverable `context_pressure` with physical KV and expert-pool capacities when growth would
+  cross that floor. Expose target and MTP draft KV usage separately in session telemetry.
+- Reuse an exact in-memory 4096-token checkpoint when a fresh agent request changes after that
+  boundary but before the rolling checkpoint. MTP checkpoints now include the draft driver's
+  carried hidden row; elastic-KV context recreation preserves it as well.
+
+## [0.36.0] - 2026-10-12
+
+### Added
+- Rebalance dedicated GPU memory between Elastic KV and the expert cache during a live session.
+  KV growth can reclaim expert slots above the per-layer minimum; later smaller requests can
+  reduce physical KV and regrow the cache toward its configured budget. Preserve the target and
+  MTP draft state and enforce the configured GPU safety rail after each allocation.
+
+## [0.35.0] - 2026-10-11
+
+### Added
+- Accept structured chat messages, function tools, and tool choice through the existing
+  session generation command. Render them with the GGUF chat template through llama.cpp
+  common chat and return parsed tool calls to clients.
+
 ## [0.34.0] - 2026-10-06
 
 ### Added

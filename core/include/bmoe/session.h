@@ -94,6 +94,11 @@ const char * think_control_name(ThinkControl c);
 // expert cache stays warm; clear_kv=false continues the KV cache for multi-turn chat.
 struct GenerateRequest {
     std::string prompt;
+    // Optional OpenAI-compatible chat input. Empty messages keeps the existing prompt path.
+    std::string messages_json;
+    std::string tools_json;
+    std::string tool_choice = "auto";
+    bool parallel_tool_calls = true;
     // Exact stable beginning of prompt, before conversation content. Empty disables capture.
     std::string claude_prefix;
     bool claude_prewarm = false; // restore/capture the stable prefix without replacing rolling state
@@ -204,7 +209,11 @@ public:
     int n_ctx() const;
     int physical_kv_tokens() const;
     size_t physical_kv_bytes() const;
+    size_t draft_kv_bytes() const;
+    int draft_kv_tokens() const;
+    int expert_performance_floor_mb() const;
     int kv_growth_count() const;
+    size_t gpu_expert_cache_bytes() const;
 
     // Experts this model actually routes per token, after any n_expert_used override — the width a
     // caller needs to interpret MoeStreamConfig::drop_cold_frac, whose threshold is a fraction of

@@ -36,10 +36,16 @@ bool fd_ok(fd_t fd);
 // actually in effect for it, because every platform can decline the request without failing the
 // open — a caller that cares must ask here, never reconstruct the answer from what it passed.
 // The caller should be prepared to reopen with direct=false for a sub-alignment tail.
-fd_t open_read(const char * path, bool direct, bool * effective_direct = nullptr);
+fd_t open_read(const char * path, bool direct, bool * effective_direct = nullptr, bool asynchronous = false);
 void close_fd(fd_t fd);
 // Positioned blocking read. Returns bytes read, 0 at EOF, -1 on error.
 long long pread_at(fd_t fd, void * buf, size_t count, uint64_t off);
+#if defined(_WIN32)
+// A completion port stays bound to one reader lane; the caller keeps OVERLAPPED storage alive
+// until this returns. Other lanes may have requests in flight at the same time.
+void * make_completion_port(fd_t fd);
+long long pread_at_iocp(fd_t fd, void * port, void * buf, size_t count, uint64_t off);
+#endif
 uint64_t file_size(fd_t fd);
 
 // Whether the platform's cache-bypassing mode constrains the read mechanics: O_DIRECT and

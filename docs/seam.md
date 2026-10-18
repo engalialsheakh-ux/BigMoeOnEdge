@@ -157,7 +157,8 @@ physical hybrid attention-KV storage from logical `n_ctx_seq`. The default
 `llama_model::create_memory`, the hybrid attention member receives `n_kv`;
 the recurrent/SSM member is unchanged. The small public capacity and byte
 getters report the allocated attention cache. BigMoe uses the public sequence
-state API to snapshot and restore around context recreation, retaining the
+state API and `common`'s MTP driver state API to snapshot and restore around
+context recreation, retaining the
 loaded `llama_model`. This delta is committed in the pinned llama.cpp submodule revision. The focused `elastic_kv_gate` checks
 logical context, live-state migration, greedy output, and agent/Claude prefix
 restart restore. The trial GPU expert-pool resizing code was removed after a
@@ -174,7 +175,10 @@ model rather than hardcoded), and `common_chat_parse` extracts a reasoning model
 it can be reported apart from the answer. The parser-params wiring lives in its own translation
 unit, `chat_parse.cpp` — the PEG parser arena has to be loaded explicitly or `common_chat_parse`
 throws on the first token, which is how issue #49 stayed invisible; keeping it separate makes
-that seam unit-testable without a model.
+that seam unit-testable without a model. Structured session requests also use
+`common_chat_msgs_parse_oaicompat` and `common_chat_tools_parse_oaicompat` before applying
+the embedded template. The same parser returns assistant tool calls, including multiple
+calls in one turn, to the session protocol. No llama.cpp source change is needed.
 
 A second translation unit, `thinking_control.cpp`, crosses the same boundary for "thinking off".
 `enable_thinking` is only a *request* to the template, and many templates never read it, so the
@@ -207,14 +211,17 @@ head, moving hidden states from the target to it, seeding the next draft from th
 Worth stating explicitly because the internals it needs (`llama_set_embeddings_nextn` and the
 `nextn` hidden-state getters) live in `src/llama-ext.h`, a *staging* header: they are used **inside**
 `speculative.cpp`, which is already compiled into the `llama-common` the engine links, so nothing in
-`core/` includes a private header and no in-tree patch is involved.
+`core/` includes a private header. The local `common/speculative.cpp` change below is limited to
+serializing the MTP driver's boundary state.
 
 What the engine does own is the pair of contexts. Self-speculation is one model with two contexts
 over it — the target, and a draft created with `ctx_type = LLAMA_CONTEXT_TYPE_MTP` — and the engine
 builds the draft one itself rather than through `common_speculative_init_from_params`, for a reason
 that belongs to this project: **the eval callback is per-context**. The streamer only sees the MTP
 block's expert layer if the draft context carries the same `cb_eval`, and `init_from_params` derives
-its context parameters from a full `common_params` with no way to inject one. See
+its context parameters from a full `common_params` with no way to inject one. The MTP driver's
+carried hidden row is exposed by a small local change to `common/speculative.cpp` through its
+existing get/set state API; `session.cpp` snapshots it beside both sequence states. See
 [mtp.md](mtp.md).
 
 Unlike the public-C-API streaming seam, `common` is **not a stable API** — it can change

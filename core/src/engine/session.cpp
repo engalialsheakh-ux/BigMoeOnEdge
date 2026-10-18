@@ -1,4 +1,6 @@
 #include "bmoe/session.h"
+#include "bmoe/adaptive_mtp.h"
+#include "bmoe/hybrid_miss.h"
 #include "bmoe/recipe.h"
 #include "bmoe/route_trace.h"
 #include "bmoe/decode_trace.h"
@@ -43,6 +45,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <new>
 #include <mutex>
 #include <sstream>
@@ -316,10 +319,9 @@ uint64_t agent_state_key(const SessionConfig & cfg) {
     const std::string serialized = settings.str();
     h = hash_bytes(h, serialized.data(), serialized.size());
     if (cfg.spec.is_mtp()) {
-        const std::string mtp_settings = "mtp-state-v2|" + std::to_string(cfg.spec.draft_max) + "|" +
-                                         std::to_string(cfg.spec.draft_p_min) + "|" +
-                                         std::to_string(cfg.gpu.elastic_kv) + "|" +
-                                         std::to_string(cfg.gpu.elastic_kv_chunk_tokens);
+        const std::string mtp_settings =
+            "mtp-state-v2|" + std::to_string(cfg.spec.draft_max) + "|" + std::to_string(cfg.spec.draft_p_min) + "|" +
+            std::to_string(cfg.gpu.elastic_kv) + "|" + std::to_string(cfg.gpu.elastic_kv_chunk_tokens);
         h = hash_bytes(h, mtp_settings.data(), mtp_settings.size());
     }
     return h;
@@ -332,6 +334,7 @@ struct AgentStateCache {
     std::vector<llama_token> tokens;
     std::vector<uint8_t> state;
     std::vector<uint8_t> draft_state;
+    std::vector<uint8_t> speculative_state;
     bool with_draft = false;
     bool disk_checked = false;
     bool restore_failed = false;
@@ -352,35 +355,43 @@ struct AgentStateCache {
         if (file_bytes < 0 || uint64_t(file_bytes) > max_state_bytes + 1024ull * 1024ull) return;
         in.seekg(0);
         char magic[8];
-        uint64_t stored_key = 0, state_size = 0, draft_size = 0, checksum = 0;
+        uint64_t stored_key = 0, state_size = 0, draft_size = 0, speculative_size = 0, checksum = 0;
         uint32_t token_count = 0;
         in.read(magic, sizeof(magic));
         in.read(reinterpret_cast<char *>(&stored_key), sizeof(stored_key));
         in.read(reinterpret_cast<char *>(&token_count), sizeof(token_count));
         in.read(reinterpret_cast<char *>(&state_size), sizeof(state_size));
         if (with_draft) in.read(reinterpret_cast<char *>(&draft_size), sizeof(draft_size));
+        if (with_draft) in.read(reinterpret_cast<char *>(&speculative_size), sizeof(speculative_size));
         in.read(reinterpret_cast<char *>(&checksum), sizeof(checksum));
-        const uint64_t header_bytes =
-            sizeof(magic) + sizeof(stored_key) + sizeof(token_count) + sizeof(state_size) +
-            (with_draft ? sizeof(draft_size) : 0) + sizeof(checksum);
-        if (!in || std::memcmp(magic, with_draft ? "BMOEAS02" : "BMOEAS01", 8) != 0 || stored_key != key ||
+        const uint64_t header_bytes = sizeof(magic) + sizeof(stored_key) + sizeof(token_count) + sizeof(state_size) +
+                                      (with_draft ? sizeof(draft_size) + sizeof(speculative_size) : 0) +
+                                      sizeof(checksum);
+        if (!in || std::memcmp(magic, with_draft ? "BMOEAS03" : "BMOEAS01", 8) != 0 || stored_key != key ||
             token_count == 0 || token_count > 262144 || state_size == 0 || state_size > max_state_bytes ||
-            (with_draft && draft_size == 0) || draft_size > max_state_bytes - state_size ||
-            uint64_t(file_bytes) != header_bytes + uint64_t(token_count) * sizeof(llama_token) + state_size + draft_size)
+            (with_draft && (draft_size == 0 || speculative_size == 0)) || draft_size > max_state_bytes - state_size ||
+            speculative_size > max_state_bytes - state_size - draft_size ||
+            uint64_t(file_bytes) !=
+                header_bytes + uint64_t(token_count) * sizeof(llama_token) + state_size + draft_size + speculative_size)
             return;
         std::vector<llama_token> loaded_tokens(token_count);
         std::vector<uint8_t> loaded_state(static_cast<size_t>(state_size));
         std::vector<uint8_t> loaded_draft(static_cast<size_t>(draft_size));
+        std::vector<uint8_t> loaded_speculative(static_cast<size_t>(speculative_size));
         in.read(reinterpret_cast<char *>(loaded_tokens.data()), std::streamsize(token_count * sizeof(llama_token)));
         in.read(reinterpret_cast<char *>(loaded_state.data()), std::streamsize(state_size));
         if (draft_size) in.read(reinterpret_cast<char *>(loaded_draft.data()), std::streamsize(draft_size));
+        if (speculative_size)
+            in.read(reinterpret_cast<char *>(loaded_speculative.data()), std::streamsize(speculative_size));
         const uint64_t token_hash =
             hash_bytes(14695981039346656037ull, loaded_tokens.data(), loaded_tokens.size() * sizeof(llama_token));
         const uint64_t state_hash = hash_bytes(token_hash, loaded_state.data(), loaded_state.size());
-        if (!in || hash_bytes(state_hash, loaded_draft.data(), loaded_draft.size()) != checksum) return;
+        const uint64_t draft_hash = hash_bytes(state_hash, loaded_draft.data(), loaded_draft.size());
+        if (!in || hash_bytes(draft_hash, loaded_speculative.data(), loaded_speculative.size()) != checksum) return;
         tokens = std::move(loaded_tokens);
         state = std::move(loaded_state);
         draft_state = std::move(loaded_draft);
+        speculative_state = std::move(loaded_speculative);
         disk_rejected = false;
     }
 
@@ -389,16 +400,28 @@ struct AgentStateCache {
         return matches(prompt) ? tokens.size() : 0;
     }
 
-    size_t restore(llama_context * ctx, llama_context * draft, const std::vector<llama_token> & prompt) {
+    size_t restore(llama_context * ctx,
+                   llama_context * draft,
+                   common_speculative * spec,
+                   const std::vector<llama_token> & prompt) {
         restore_failed = false;
         if (!disk_checked && state.empty()) read_disk();
-        if (!matches(prompt) || (with_draft && (!draft || draft_state.empty()))) return 0;
+        if (!matches(prompt) || (with_draft && (!draft || !spec || draft_state.empty() || speculative_state.empty())))
+            return 0;
         const size_t read = llama_state_seq_set_data(ctx, state.data(), state.size(), 0);
-        const size_t draft_read = with_draft ? llama_state_seq_set_data(draft, draft_state.data(), draft_state.size(), 0) : 0;
-        if (read != state.size() || (with_draft && draft_read != draft_state.size())) {
+        const size_t draft_read =
+            with_draft ? llama_state_seq_set_data(draft, draft_state.data(), draft_state.size(), 0) : 0;
+        std::vector<uint8_t> restored_speculative;
+        if (with_draft) {
+            common_speculative_set_state(spec, 0, speculative_state);
+            if (!common_speculative_get_state(spec, 0, restored_speculative)) restored_speculative.clear();
+        }
+        if (read != state.size() ||
+            (with_draft && (draft_read != draft_state.size() || restored_speculative != speculative_state))) {
             restore_failed = true;
             state.clear();
             draft_state.clear();
+            speculative_state.clear();
             tokens.clear();
             return 0;
         }
@@ -406,26 +429,35 @@ struct AgentStateCache {
     }
 
     bool persist() const {
-        if (path.empty() || key == 0 || state.empty() || (with_draft && draft_state.empty())) return false;
+        if (path.empty() || key == 0 || state.empty() ||
+            (with_draft && (draft_state.empty() || speculative_state.empty())))
+            return false;
         const std::string temp = path + ".tmp";
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) return false;
         const uint32_t token_count = static_cast<uint32_t>(tokens.size());
         const uint64_t state_size = state.size();
         const uint64_t draft_size = draft_state.size();
+        const uint64_t speculative_size = speculative_state.size();
         const uint64_t token_hash =
             hash_bytes(14695981039346656037ull, tokens.data(), tokens.size() * sizeof(llama_token));
         const uint64_t state_hash = hash_bytes(token_hash, state.data(), state.size());
-        const uint64_t checksum = hash_bytes(state_hash, draft_state.data(), draft_state.size());
-        out.write(with_draft ? "BMOEAS02" : "BMOEAS01", 8);
+        const uint64_t draft_hash = hash_bytes(state_hash, draft_state.data(), draft_state.size());
+        const uint64_t checksum = hash_bytes(draft_hash, speculative_state.data(), speculative_state.size());
+        out.write(with_draft ? "BMOEAS03" : "BMOEAS01", 8);
         out.write(reinterpret_cast<const char *>(&key), sizeof(key));
         out.write(reinterpret_cast<const char *>(&token_count), sizeof(token_count));
         out.write(reinterpret_cast<const char *>(&state_size), sizeof(state_size));
         if (with_draft) out.write(reinterpret_cast<const char *>(&draft_size), sizeof(draft_size));
+        if (with_draft) out.write(reinterpret_cast<const char *>(&speculative_size), sizeof(speculative_size));
         out.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
         out.write(reinterpret_cast<const char *>(tokens.data()), std::streamsize(tokens.size() * sizeof(llama_token)));
         out.write(reinterpret_cast<const char *>(state.data()), std::streamsize(state.size()));
-        if (with_draft) out.write(reinterpret_cast<const char *>(draft_state.data()), std::streamsize(draft_state.size()));
+        if (with_draft)
+            out.write(reinterpret_cast<const char *>(draft_state.data()), std::streamsize(draft_state.size()));
+        if (with_draft)
+            out.write(reinterpret_cast<const char *>(speculative_state.data()),
+                      std::streamsize(speculative_state.size()));
         out.close();
         if (!out) return false;
 #ifdef _WIN32
@@ -438,7 +470,11 @@ struct AgentStateCache {
 #endif
     }
 
-    bool capture(llama_context * ctx, llama_context * draft, const std::vector<llama_token> & prompt, size_t count) {
+    bool capture(llama_context * ctx,
+                 llama_context * draft,
+                 common_speculative * spec,
+                 const std::vector<llama_token> & prompt,
+                 size_t count) {
         if (key == 0 || count == 0 || count >= prompt.size()) return false;
         if (tokens.size() == count && std::equal(tokens.begin(), tokens.end(), prompt.begin())) return false;
         const size_t bytes = llama_state_seq_get_size(ctx, 0);
@@ -446,11 +482,16 @@ struct AgentStateCache {
         std::vector<uint8_t> snapshot(bytes);
         if (llama_state_seq_get_data(ctx, snapshot.data(), snapshot.size(), 0) != bytes) return false;
         std::vector<uint8_t> draft_snapshot;
+        std::vector<uint8_t> speculative_snapshot;
         if (with_draft) {
-            if (!draft) return false;
+            if (!draft || !spec || !common_speculative_get_state(spec, 0, speculative_snapshot) ||
+                speculative_snapshot.empty())
+                return false;
             llama_synchronize(draft);
             const size_t draft_bytes = llama_state_seq_get_size(draft, 0);
-            if (draft_bytes == 0 || draft_bytes > max_state_bytes - bytes) return false;
+            if (draft_bytes == 0 || speculative_snapshot.size() > max_state_bytes - bytes ||
+                draft_bytes > max_state_bytes - bytes - speculative_snapshot.size())
+                return false;
             draft_snapshot.resize(draft_bytes);
             if (llama_state_seq_get_data(draft, draft_snapshot.data(), draft_snapshot.size(), 0) != draft_bytes)
                 return false;
@@ -458,8 +499,10 @@ struct AgentStateCache {
         tokens.assign(prompt.begin(), prompt.begin() + count);
         state = std::move(snapshot);
         draft_state = std::move(draft_snapshot);
+        speculative_state = std::move(speculative_snapshot);
         disk_checked = true;
-        if (!persist()) std::fprintf(stderr, "bmoe: agent state cache could not write %s\n", path.c_str());
+        if (!path.empty() && !persist())
+            std::fprintf(stderr, "bmoe: agent state cache could not write %s\n", path.c_str());
         return true;
     }
 };
@@ -472,6 +515,8 @@ struct Session::Impl {
     SessionConfig cfg;
     AgentStateCache agent_cache;
     AgentStateCache claude_cache;
+    AgentStateCache mid_prompt_cache;
+    size_t previous_prompt_tokens = 0;
     std::string arch;
     double load_seconds = 0.0;
 
@@ -486,9 +531,44 @@ struct Session::Impl {
     std::unique_ptr<RouterHook> hook; // heap: its address is baked into cparams.cb_eval_user_data
     ExpertStreamSource source;
     GpuExpertPool gpu_experts;
+    ggml_backend_dev_t gpu_device = nullptr;
+    std::vector<LayerExperts> gpu_cache_layers;
+    int gpu_cache_expert_count = 0;
+    int gpu_pool_max_mb = 0;
+    bool context_pressure = false;
+    int pressure_required_tokens = 0;
+
+    int expert_performance_floor_mb() const {
+        if (!gpu_pool_mb) return 0;
+        const int technical_mb = int((gpu_experts.minimum_bytes() + (1ull << 20) - 1) >> 20);
+        return std::min(gpu_pool_max_mb, std::max(technical_mb, cfg.gpu.expert_performance_floor_mb));
+    }
+    int gpu_pool_mb = 0;
+    ggml_backend_buffer_t mtp_expert_bank = nullptr;
+    size_t mtp_expert_bank_bytes = 0;
+    int mtp_expert_bank_layers = 0;
+    int mtp_expert_bank_tensors = 0;
     std::unique_ptr<ggml_context, void (*)(ggml_context *)> gpu_expert_metadata{nullptr, ggml_free};
     std::vector<llama_expert_cache_layer> gpu_expert_layers;
+    std::vector<llama_expert_cache_layer> gpu_lru_layers;
+    struct GpuStageJob {
+        Impl * session = nullptr;
+        int layer = -1;
+    };
+    std::vector<GpuStageJob> gpu_stage_jobs;
     bool gpu_graph_attached = false;
+    bool gpu_owned_graph = false;
+    std::atomic<uint64_t> gpu_stage_calls{0};
+    std::atomic<uint64_t> gpu_stage_misses{0};
+    std::atomic<uint64_t> gpu_stage_bytes{0};
+    std::atomic<uint64_t> gpu_fill_metadata_d2h_bytes{0};
+    std::atomic<uint64_t> hybrid_h2d_bytes{0};
+    std::atomic<uint64_t> hybrid_h2d_ns{0};
+    double hybrid_cpu_ms_per_expert = 0.0;
+    uint64_t hybrid_assigned_bytes = 0;
+    uint64_t hybrid_overflow_waves = 0;
+    uint64_t hybrid_staged_experts = 0;
+    std::array<std::vector<uint8_t>, MoeRecipe::max_exps> hybrid_stage_copy;
     uint64_t gpu_promotions = 0;
     uint64_t gpu_upload_bytes = 0;
     uint64_t gpu_upload_calls = 0;
@@ -516,6 +596,127 @@ struct Session::Impl {
     bool gpu_worker_stop = false;
     size_t gpu_pending_bytes = 0;
     static constexpr size_t gpu_staging_limit = 128ull * 1024ull * 1024ull;
+
+    static void on_gpu_stage(void * user_data) {
+        auto * job = static_cast<GpuStageJob *>(user_data);
+        Impl & im = *job->session;
+        const int layer = job->layer;
+        const int slots = im.gpu_experts.layers()[size_t(layer)].slot_count;
+        const int32_t * fills = im.gpu_experts.host_fill_list(layer);
+        const int count = fills ? fills[2 * slots] : -1;
+        if (count < 0 || count >= slots) {
+            std::fprintf(stderr, "bmoe: invalid GPU expert fill count at layer %d\n", layer);
+            std::abort();
+        }
+        im.gpu_stage_calls.fetch_add(1, std::memory_order_relaxed);
+        im.gpu_fill_metadata_d2h_bytes.fetch_add(size_t(2 * slots + 1) * sizeof(int32_t), std::memory_order_relaxed);
+        if (count == 0) return;
+        std::vector<int32_t> ids;
+        ids.reserve(size_t(count));
+        for (int i = 0; i < count; ++i) {
+            const int expert = fills[2 * i];
+            const int slot = fills[2 * i + 1];
+            if (expert < 0 || expert >= im.gpu_experts.expert_count() || slot <= 0 || slot >= slots) {
+                std::fprintf(stderr, "bmoe: invalid GPU expert fill at layer %d\n", layer);
+                std::abort();
+            }
+            ids.push_back(expert);
+        }
+        if (!im.source.load_layer(layer, ids.data(), count)) {
+            std::fprintf(stderr, "bmoe: GPU expert staging I/O failed at layer %d\n", layer);
+            std::abort();
+        }
+        uint64_t bytes_staged = 0;
+        for (int i = 0; i < count; ++i) {
+            const int expert = ids[size_t(i)];
+            if (!im.source.wait_resident_bundle(layer, expert)) {
+                std::fprintf(stderr, "bmoe: GPU expert staging wait failed at layer %d\n", layer);
+                std::abort();
+            }
+            const void * bytes[MoeRecipe::max_exps]{};
+            size_t sizes[MoeRecipe::max_exps]{};
+            if (!im.source.resident_bundle(layer, expert, bytes, sizes)) {
+                std::fprintf(stderr, "bmoe: GPU expert staging has no resident bundle at layer %d\n", layer);
+                std::abort();
+            }
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                if (!im.gpu_experts.stage_projection(layer, i, p, bytes[p], sizes[p])) {
+                    std::fprintf(stderr, "bmoe: GPU expert projection staging failed at layer %d\n", layer);
+                    std::abort();
+                }
+                bytes_staged += sizes[p];
+            }
+        }
+        im.gpu_stage_misses.fetch_add(size_t(count), std::memory_order_relaxed);
+        im.gpu_stage_bytes.fetch_add(bytes_staged, std::memory_order_relaxed);
+    }
+
+    static bool on_hybrid_upload(void * user_data,
+                                 int layer,
+                                 const std::vector<int32_t> & misses,
+                                 std::vector<int32_t> & uploaded) {
+        auto & im = *static_cast<Impl *>(user_data);
+        if (im.hybrid_cpu_ms_per_expert <= 0.0 || im.gpu_worker_failed.load(std::memory_order_acquire)) return true;
+        std::vector<int32_t> resident;
+        std::vector<uint8_t> seen(size_t(im.gpu_experts.expert_count()), 0);
+        for (int32_t expert : misses) {
+            if (expert < 0 || size_t(expert) >= seen.size()) return false;
+            if (seen[size_t(expert)]) continue;
+            seen[size_t(expert)] = 1;
+            const void * bytes[MoeRecipe::max_exps]{};
+            size_t sizes[MoeRecipe::max_exps]{};
+            if (im.source.resident_bundle(layer, expert, bytes, sizes)) resident.push_back(expert);
+        }
+        if (resident.empty()) return true;
+        const uint64_t transferred = im.hybrid_h2d_bytes.load(std::memory_order_relaxed);
+        const uint64_t transfer_ns = im.hybrid_h2d_ns.load(std::memory_order_relaxed);
+        const HybridMissCosts costs{im.hybrid_cpu_ms_per_expert,
+                                    transferred && transfer_ns ? double(transfer_ns) / (1e6 * double(transferred))
+                                                               : 0.0,
+                                    0.0, std::max(1, im.cfg.n_threads)};
+        const int available = im.gpu_experts.available_slots(layer);
+        int chosen = choose_gpu_misses(int(misses.size()), int(resident.size()), available,
+                                       im.source.expert_bytes(layer), costs);
+        // Bound direct miss uploads to one pool's worth per session. Repeated evict/reupload cycles
+        // otherwise turn a nominally cheap GPU miss into sustained PCIe traffic.
+        const uint64_t budget = im.gpu_experts.allocated_bytes();
+        const uint64_t expert_bytes = im.source.expert_bytes(layer);
+        const uint64_t remaining = budget > im.hybrid_assigned_bytes ? budget - im.hybrid_assigned_bytes : 0;
+        chosen = expert_bytes ? std::min(chosen, int(remaining / expert_bytes)) : 0;
+        if (chosen > 0) ++im.hybrid_overflow_waves;
+        for (int i = 0; i < chosen; ++i) {
+            const int expert = resident[size_t(i)];
+            const void * source_bytes[MoeRecipe::max_exps]{};
+            size_t sizes[MoeRecipe::max_exps]{};
+            if (!im.source.resident_bundle(layer, expert, source_bytes, sizes)) continue;
+            const auto started = clock_t_::now();
+            for (int p = 0; p < MoeRecipe::max_exps; ++p) {
+                im.hybrid_stage_copy[p].resize(sizes[p]);
+                std::memcpy(im.hybrid_stage_copy[p].data(), source_bytes[p], sizes[p]);
+            }
+            const auto lease = im.gpu_experts.reserve(layer, expert);
+            if (!lease) continue;
+            bool complete = true;
+            for (int p = 0; p < MoeRecipe::max_exps; ++p)
+                if (!im.gpu_experts.upload(lease, p, im.hybrid_stage_copy[p].data(), im.hybrid_stage_copy[p].size())) {
+                    complete = false;
+                    break;
+                }
+            if (!complete || !im.gpu_experts.publish(lease)) {
+                im.gpu_experts.abandon(lease);
+                return false;
+            }
+            const uint64_t bytes = uint64_t(sizes[0] + sizes[1] + sizes[2]);
+            im.hybrid_assigned_bytes += bytes;
+            im.hybrid_h2d_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            im.hybrid_h2d_ns.fetch_add(
+                uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - started).count()),
+                std::memory_order_relaxed);
+            uploaded.push_back(expert);
+            ++im.hybrid_staged_experts;
+        }
+        return true;
+    }
 
     // Prefill on an accelerator (SessionConfig::prefill); null when off. Created before the model
     // load, whose device list it holds, and opened after it.
@@ -554,6 +755,13 @@ struct Session::Impl {
                 gpu_upload_ms += secs(started, clock_t_::now()) * 1000.0;
                 if (uploaded && gpu_experts.publish(lease)) {
                     gpu_upload_bytes += job.total_bytes;
+                    if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid) {
+                        hybrid_h2d_bytes.fetch_add(job.total_bytes, std::memory_order_relaxed);
+                        hybrid_h2d_ns.fetch_add(
+                            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - started)
+                                         .count()),
+                            std::memory_order_relaxed);
+                    }
                     ++gpu_promotions;
                     published = true;
                 } else {
@@ -594,14 +802,27 @@ struct Session::Impl {
     }
     void set_gpu_graph_for_batch(llama_context * c, const llama_batch & b) {
         if (!gpu_experts.buffer() || !hook) return;
-        const bool want = hook->batch_phase() == 1 && b.n_tokens == 1;
-        if (want == gpu_graph_attached) return;
-        llama_set_expert_cache_layers(c, want ? gpu_expert_layers.data() : nullptr,
-                                      want ? gpu_expert_layers.size() : 0);
+        const bool want = hook->batch_phase() == 1 && b.n_tokens > 0;
+        bool upload = want && cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload &&
+                      gpu_experts.host_stage_available() && n_expert_used > 0 && !route_trace && !compute_trace;
+        if (upload)
+            for (const auto & layer : gpu_experts.layers())
+                if (layer.slot_count && layer.slot_count - 1 < b.n_tokens * n_expert_used) {
+                    upload = false;
+                    break;
+                }
+        hook->set_gpu_owned_mode(upload);
+        if (want == gpu_graph_attached && upload == gpu_owned_graph) return;
+        const auto & descriptors = upload ? gpu_lru_layers : gpu_expert_layers;
+        llama_set_expert_cache_layers(c, want ? descriptors.data() : nullptr, want ? descriptors.size() : 0);
         gpu_graph_attached = want;
+        gpu_owned_graph = upload;
     }
     bool promote_gpu_misses(int step) {
-        if (!gpu_experts.buffer() || !hook || !cfg.gpu.expert_cache_promote) return true;
+        if (!gpu_experts.buffer() || !hook || !cfg.gpu.expert_cache_promote ||
+            (cfg.gpu.expert_miss_mode != RunConfig::GpuConfig::ExpertMissMode::Cpu &&
+             cfg.gpu.expert_miss_mode != RunConfig::GpuConfig::ExpertMissMode::Hybrid))
+            return true;
         if (gpu_worker_failed.load(std::memory_order_acquire)) return false;
         if (hook->gpu_misses().empty()) return true;
         ++gpu_decode_sequence;
@@ -702,13 +923,198 @@ struct Session::Impl {
         return mtp != nullptr;
     }
 
-    bool ensure_kv_capacity(int required_tokens, std::string & error) {
-        if (!cfg.gpu.elastic_kv || required_tokens <= physical_kv_tokens) return true;
+    bool bind_mtp_expert_bank(ggml_backend_dev_t device, std::vector<LayerExperts> & layers, std::string & error) {
+        if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            error = "MTP expert bank requires a GPU device";
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(device);
+        if (!buft) {
+            error = "MTP expert bank has no GPU buffer type";
+            return false;
+        }
+        const size_t alignment = std::max<size_t>(128, ggml_backend_buft_get_alignment(buft));
+        struct Upload {
+            ggml_tensor * tensor;
+            const void * source;
+            size_t offset;
+            size_t bytes;
+        };
+        std::vector<Upload> uploads;
+        size_t bank_bytes = 0;
+        size_t uploaded_bytes = 0;
+        int bank_layers = 0;
+        for (size_t il = size_t(n_layer); il < layers.size(); ++il) {
+            if (!layers[il].bound) {
+                error = "MTP expert layer was not captured";
+                return false;
+            }
+            ++bank_layers;
+            for (const auto & projection : layers[il].proj) {
+                ggml_tensor * tensor = projection.tensor;
+                if (!tensor) continue;
+                if (!tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer)) {
+                    error = std::string("MTP expert tensor is not host-backed: ") + tensor->name;
+                    return false;
+                }
+                const size_t bytes = ggml_nbytes(tensor);
+                const size_t allocated = ggml_backend_buft_get_alloc_size(buft, tensor);
+                const size_t aligned = (bank_bytes + alignment - 1) / alignment * alignment;
+                if (!bytes || allocated < bytes || aligned < bank_bytes ||
+                    allocated > std::numeric_limits<size_t>::max() - aligned) {
+                    error = std::string("invalid MTP expert tensor size: ") + tensor->name;
+                    return false;
+                }
+                uploads.push_back({tensor, tensor->data, aligned, bytes});
+                bank_bytes = aligned + allocated;
+                uploaded_bytes += bytes;
+            }
+        }
+        if (!bank_layers || uploads.empty()) {
+            error = "MTP expert bank has no captured expert tensors";
+            return false;
+        }
+        size_t free_before = 0, total = 0;
+        ggml_backend_dev_memory(device, &free_before, &total);
+        const size_t safety = size_t(cfg.gpu.safety_mb) * 1024ull * 1024ull;
+        if (!total || free_before < bank_bytes || free_before - bank_bytes < safety) {
+            error = "insufficient dedicated VRAM for the complete MTP expert bank and safety rail";
+            return false;
+        }
+        ggml_backend_buffer_t bank = ggml_backend_buft_alloc_buffer(buft, bank_bytes);
+        if (!bank || !ggml_backend_buffer_get_base(bank)) {
+            if (bank) ggml_backend_buffer_free(bank);
+            error = "MTP expert bank GPU allocation failed";
+            return false;
+        }
+        size_t free_after = 0;
+        ggml_backend_dev_memory(device, &free_after, &total);
+        if (free_after < safety) {
+            ggml_backend_buffer_free(bank);
+            error = "MTP expert bank allocation crossed the configured GPU safety rail";
+            return false;
+        }
+        char * base = static_cast<char *>(ggml_backend_buffer_get_base(bank));
+        for (const Upload & upload : uploads) {
+            ggml_tensor view = *upload.tensor;
+            view.buffer = bank;
+            view.data = base + upload.offset;
+            view.extra = nullptr;
+            if (ggml_backend_buffer_init_tensor(bank, &view) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(bank);
+                error = std::string("MTP expert GPU tensor initialization failed: ") + upload.tensor->name;
+                return false;
+            }
+            constexpr size_t upload_chunk = 16ull * 1024ull * 1024ull;
+            for (size_t done = 0; done < upload.bytes; done += upload_chunk) {
+                const size_t count = std::min(upload_chunk, upload.bytes - done);
+                ggml_backend_tensor_set(&view, static_cast<const char *>(upload.source) + done, done, count);
+            }
+        }
+        for (const Upload & upload : uploads) {
+            upload.tensor->buffer = bank;
+            upload.tensor->data = base + upload.offset;
+            upload.tensor->extra = nullptr;
+        }
+        for (size_t il = size_t(n_layer); il < layers.size(); ++il)
+            layers[il].bound = false;
+        mtp_expert_bank = bank;
+        mtp_expert_bank_bytes = bank_bytes;
+        mtp_expert_bank_layers = bank_layers;
+        mtp_expert_bank_tensors = int(uploads.size());
+        std::fprintf(stderr,
+                     "bmoe-mtp-bank: resident_layers=%d resident_tensors=%d resident_mib=%.1f "
+                     "uploaded_mib=%.1f free_after_mib=%.1f safety_mib=%d\n",
+                     bank_layers, mtp_expert_bank_tensors, double(bank_bytes) / (1024.0 * 1024.0),
+                     double(uploaded_bytes) / (1024.0 * 1024.0), double(free_after) / (1024.0 * 1024.0),
+                     cfg.gpu.safety_mb);
+        return true;
+    }
+
+    // Contexts and the promotion worker must be quiescent before replacing graph-backed tensors.
+    bool rebuild_gpu_expert_pool(int budget_mb, std::string & error) {
+        if (hook) hook->set_gpu_expert_pool(nullptr);
+        gpu_expert_layers.clear();
+        gpu_lru_layers.clear();
+        gpu_stage_jobs.clear();
+        gpu_expert_metadata.reset();
+        gpu_experts.reset();
+        gpu_pool_mb = 0;
+        gpu_graph_attached = false;
+        gpu_owned_graph = false;
+        if (!budget_mb) return true;
+        if (!gpu_experts.init(gpu_device, budget_mb, gpu_cache_expert_count, gpu_cache_layers, error, cfg.gpu.safety_mb,
+                              cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload))
+            return false;
+        if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload &&
+            !gpu_experts.host_stage_available()) {
+            error = "GPU expert upload mode requires mapped pinned host staging on this CUDA device";
+            return false;
+        }
+        gpu_recent_miss.assign(gpu_cache_layers.size() * size_t(gpu_cache_expert_count), 0);
+        gpu_queued.assign(gpu_cache_layers.size() * size_t(gpu_cache_expert_count), 0);
+        gpu_decode_sequence = 0;
+        ggml_init_params metadata_params{};
+        metadata_params.mem_size = ggml_tensor_overhead() * (gpu_cache_layers.size() * 16 + 16);
+        metadata_params.no_alloc = true;
+        gpu_expert_metadata.reset(ggml_init(metadata_params));
+        if (!gpu_expert_metadata) {
+            error = "GPU expert cache metadata allocation failed";
+            return false;
+        }
+        gpu_expert_layers.resize(gpu_cache_layers.size());
+        if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload) {
+            gpu_lru_layers.resize(gpu_cache_layers.size());
+            gpu_stage_jobs.resize(gpu_cache_layers.size());
+        }
+        for (size_t il = 0; il < gpu_cache_layers.size(); ++il) {
+            if (!gpu_cache_layers[il].bound) continue;
+            auto & descriptor = gpu_expert_layers[il];
+            descriptor.gate = gpu_experts.make_weight_tensor(gpu_expert_metadata.get(), int(il), 0);
+            descriptor.up = gpu_experts.make_weight_tensor(gpu_expert_metadata.get(), int(il), 1);
+            descriptor.down = gpu_experts.make_weight_tensor(gpu_expert_metadata.get(), int(il), 2);
+            descriptor.host_table = gpu_experts.make_host_table(gpu_expert_metadata.get(), int(il));
+            descriptor.device_table = gpu_experts.make_device_table(gpu_expert_metadata.get(), int(il));
+            descriptor.dummy_slot = 0;
+            descriptor.overlap_cpu = cfg.gpu.expert_overlap;
+            if (!descriptor.gate || !descriptor.up || !descriptor.down || !descriptor.host_table ||
+                !descriptor.device_table) {
+                error = "GPU expert cache requires split gate/up/down tensors in every bound MoE layer";
+                return false;
+            }
+            if (!gpu_lru_layers.empty()) {
+                auto & lru = gpu_lru_layers[il];
+                lru = descriptor;
+                lru.state = gpu_experts.make_device_state(gpu_expert_metadata.get(), int(il));
+                lru.host_gate = gpu_experts.make_host_stage_tensor(gpu_expert_metadata.get(), int(il), 0);
+                lru.host_up = gpu_experts.make_host_stage_tensor(gpu_expert_metadata.get(), int(il), 1);
+                lru.host_down = gpu_experts.make_host_stage_tensor(gpu_expert_metadata.get(), int(il), 2);
+                lru.n_expert = gpu_cache_expert_count;
+                lru.n_slots = gpu_experts.layers()[il].slot_count;
+                lru.host_fill_list = gpu_experts.host_fill_list(int(il));
+                gpu_stage_jobs[il] = {this, int(il)};
+                lru.stage_callback = &Impl::on_gpu_stage;
+                lru.stage_user_data = &gpu_stage_jobs[il];
+                if (!lru.state || !lru.host_gate || !lru.host_up || !lru.host_down || !lru.host_fill_list) {
+                    error = "GPU expert upload metadata allocation failed";
+                    return false;
+                }
+            }
+        }
+        gpu_pool_mb = budget_mb;
+        if (hook) hook->set_gpu_expert_pool(&gpu_experts);
+        return true;
+    }
+
+    bool resize_kv_and_gpu_cache(int target, int target_pool_mb, std::string & error) {
+        if (target == physical_kv_tokens && target_pool_mb == gpu_pool_mb) return true;
         const auto started = clock_t_::now();
-        const int chunk = cfg.gpu.elastic_kv_chunk_tokens;
-        const int target = int(std::min<int64_t>(cfg.n_ctx, (int64_t(required_tokens) + chunk - 1) / chunk * chunk));
-        if (target < required_tokens || !drain_gpu_worker()) {
-            error = "elastic KV cannot grow: capacity or GPU upload barrier failed";
+        if (!drain_gpu_worker()) {
+            error = "elastic KV GPU upload barrier failed";
+            return false;
+        }
+        if (hook && !hook->gpu_pool_idle()) {
+            error = "elastic KV cannot replace a GPU expert pool with pinned graph slots";
             return false;
         }
         llama_synchronize(ctx.get());
@@ -726,7 +1132,12 @@ struct Session::Impl {
         }
 
         std::vector<uint8_t> draft_state;
+        std::vector<uint8_t> speculative_state;
         if (ctx_dft) {
+            if (!mtp || !common_speculative_get_state(mtp.get(), 0, speculative_state) || speculative_state.empty()) {
+                error = "elastic KV could not snapshot the MTP driver state";
+                return false;
+            }
             llama_synchronize(ctx_dft.get());
             const size_t draft_bytes = llama_state_seq_get_size(ctx_dft.get(), 0);
             try {
@@ -744,9 +1155,15 @@ struct Session::Impl {
 
         // Recreating the context releases its KV buffers and captured graphs without reloading model weights.
         const uint32_t old_capacity = context_params.n_kv;
+        const int old_pool_mb = gpu_pool_mb;
+        const int minimum_pool_mb = expert_performance_floor_mb();
         mtp.reset();
         ctx_dft.reset();
         ctx.reset();
+        if (target_pool_mb != old_pool_mb) {
+            std::string release_error;
+            rebuild_gpu_expert_pool(0, release_error);
+        }
         auto recreate = [&](uint32_t capacity) -> bool {
             context_params.n_kv = capacity;
             ctx.reset(llama_init_from_model(model.get(), context_params));
@@ -771,37 +1188,126 @@ struct Session::Impl {
                 ctx_dft.reset(llama_init_from_model(model.get(), dparams));
                 if (!ctx_dft) return false;
                 llama_set_n_threads(ctx_dft.get(), cfg.n_threads, cfg.n_threads);
-                if (!draft_state.empty() &&
-                    llama_state_seq_set_data(ctx_dft.get(), draft_state.data(), draft_state.size(), 0) !=
-                        draft_state.size())
+                if (!draft_state.empty() && llama_state_seq_set_data(ctx_dft.get(), draft_state.data(),
+                                                                     draft_state.size(), 0) != draft_state.size())
                     return false;
                 if (!init_mtp_driver()) return false;
+                common_speculative_set_state(mtp.get(), 0, speculative_state);
+                std::vector<uint8_t> restored_speculative;
+                if (!common_speculative_get_state(mtp.get(), 0, restored_speculative) ||
+                    restored_speculative != speculative_state)
+                    return false;
             }
             return true;
         };
 
-        if (!recreate(uint32_t(target))) {
+        bool resized = recreate(uint32_t(target));
+        std::string pool_error;
+        auto rebuild_with_rail = [&](int requested_mb) {
+            for (int candidate = requested_mb, tries = 0; candidate >= minimum_pool_mb && tries < 8;
+                 candidate -= 2, ++tries) {
+                if (rebuild_gpu_expert_pool(candidate, pool_error)) return true;
+                if (pool_error.find("dedicated GPU memory") == std::string::npos &&
+                    pool_error.find("GPU expert allocation") == std::string::npos)
+                    break;
+            }
+            return false;
+        };
+        if (resized && target_pool_mb != old_pool_mb) resized = rebuild_with_rail(target_pool_mb);
+        if (resized && gpu_device) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(gpu_device, &free_bytes, &total_bytes);
+            const size_t safety = size_t(cfg.gpu.safety_mb) * 1024ull * 1024ull;
+            while (total_bytes && free_bytes < safety && gpu_experts.buffer()) {
+                const int minimum_mb = expert_performance_floor_mb();
+                if (gpu_pool_mb <= minimum_mb) break;
+                const size_t deficit_mb = std::max<size_t>(2, (safety - free_bytes + (1ull << 20) - 1) >> 20);
+                const int smaller_mb =
+                    gpu_pool_mb - int(std::min<size_t>(deficit_mb, size_t(gpu_pool_mb - minimum_mb)));
+                if (!rebuild_with_rail(smaller_mb)) break;
+                ggml_backend_dev_memory(gpu_device, &free_bytes, &total_bytes);
+            }
+            resized = total_bytes && free_bytes >= safety && (gpu_pool_mb == 0 || gpu_experts.buffer());
+            if (!resized && pool_error.empty()) pool_error = "dedicated-VRAM safety rail could not be preserved";
+        }
+        if (!resized) {
             mtp.reset();
             ctx_dft.reset();
             ctx.reset();
+            if (gpu_pool_mb != old_pool_mb || !gpu_experts.buffer()) {
+                std::string restore_error;
+                if (!rebuild_gpu_expert_pool(old_pool_mb, restore_error)) {
+                    // Preserve the sequence even if another process consumed the old cache's VRAM.
+                    rebuild_gpu_expert_pool(0, restore_error);
+                    pool_error += "; previous GPU cache could not be restored: " + restore_error;
+                }
+            }
             const bool restored = recreate(old_capacity);
             gpu_graph_attached = false;
+            gpu_owned_graph = false;
             if (hook) hook->reset_gpu_graph_discovery();
-            error = restored ? "elastic KV could not allocate or restore the larger context; previous state restored"
-                             : "elastic KV could not allocate the larger context or restore the previous state";
+            error = restored ? "elastic KV/cache resize failed; previous sequence restored"
+                             : "elastic KV/cache resize failed and previous sequence could not be restored";
+            if (!pool_error.empty()) error += ": " + pool_error;
             return false;
         }
         gpu_graph_attached = false;
+        gpu_owned_graph = false;
         if (hook) hook->reset_gpu_graph_discovery();
         physical_kv_tokens = int(llama_get_kv_cache_capacity(ctx.get()));
-        ++kv_growth_count;
+        if (target > int(old_capacity)) ++kv_growth_count;
         std::fprintf(stderr,
                      "bmoe-elastic-kv: logical_tokens=%u physical_tokens=%d allocated_mib=%.1f growth_count=%d "
-                     "grow_restore_ms=%.1f\n",
+                     "cache_mib=%d resize_restore_ms=%.1f\n",
                      llama_n_ctx(ctx.get()), physical_kv_tokens,
-                     double(llama_get_kv_cache_size_bytes(ctx.get())) / (1024.0 * 1024.0), kv_growth_count,
+                     double(llama_get_kv_cache_size_bytes(ctx.get())) / (1024.0 * 1024.0), kv_growth_count, gpu_pool_mb,
                      secs(started, clock_t_::now()) * 1000.0);
         return true;
+    }
+
+    bool ensure_kv_capacity(int required_tokens, std::string & error) {
+        if (!cfg.gpu.elastic_kv || required_tokens <= physical_kv_tokens) return true;
+        const int chunk = cfg.gpu.elastic_kv_chunk_tokens;
+        const int target = int(std::min<int64_t>(cfg.n_ctx, (int64_t(required_tokens) + chunk - 1) / chunk * chunk));
+        if (target < required_tokens) {
+            error = "elastic KV cannot grow beyond the logical context";
+            return false;
+        }
+        int target_pool_mb = gpu_pool_mb;
+        if (gpu_device) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(gpu_device, &free_bytes, &total_bytes);
+            const size_t current_kv =
+                llama_get_kv_cache_size_bytes(ctx.get()) + (ctx_dft ? llama_get_kv_cache_size_bytes(ctx_dft.get()) : 0);
+            const size_t growth = current_kv * size_t(target - physical_kv_tokens) / size_t(physical_kv_tokens);
+            const size_t safety = size_t(cfg.gpu.safety_mb) * 1024ull * 1024ull;
+            if (!total_bytes) {
+                error = "elastic KV cannot query dedicated GPU memory";
+                return false;
+            }
+            const size_t headroom = free_bytes > safety ? free_bytes - safety : 0;
+            // Graph variants and CUDA allocation rounding consume VRAM after context creation.
+            // Match the 64 MiB runtime reserve used by the startup auto budget.
+            const size_t reserved_growth = growth + 64ull * 1024ull * 1024ull;
+            if (reserved_growth > headroom) {
+                const size_t reclaim_mb = (reserved_growth - headroom + (1ull << 20) - 1) >> 20;
+                const int minimum_mb = expert_performance_floor_mb();
+                if (!gpu_pool_mb || reclaim_mb > size_t(std::max(0, gpu_pool_mb - minimum_mb))) {
+                    context_pressure = true;
+                    pressure_required_tokens = target;
+                    error = "elastic KV growth requires conversation compaction at the GPU expert performance floor";
+                    return false;
+                }
+                target_pool_mb -= int(reclaim_mb);
+            }
+        }
+        if (resize_kv_and_gpu_cache(target, target_pool_mb, error)) return true;
+        if (error.find("previous sequence restored") != std::string::npos) {
+            context_pressure = true;
+            pressure_required_tokens = target;
+            error = "elastic KV growth requires conversation compaction: " + error;
+        }
+        return false;
     }
 
     // The MTP draft source (SpecConfig::source == mtp). A SECOND context over the SAME model,
@@ -819,6 +1325,7 @@ struct Session::Impl {
     llama_batch mtp_batch{};
     bool mtp_batch_owned = false; // whether mtp_batch holds a llama_batch_init allocation to free
     std::vector<llama_token> draft_buf;
+    AdaptiveMtpWidth mtp_width;
     long long mtp_drafted = 0;
     long long mtp_accepted = 0;
     long long mtp_decodes = 0;
@@ -900,8 +1407,41 @@ struct Session::Impl {
 
     ~Impl() {
         stop_gpu_worker();
+        if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid && gpu_experts.buffer() && hook) {
+            const uint64_t h2d_bytes = hybrid_h2d_bytes.load(std::memory_order_relaxed);
+            const uint64_t h2d_ns = hybrid_h2d_ns.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "bmoe-hybrid: gpu_hits=%llu misses_assigned_gpu=%llu misses_assigned_cpu=%llu "
+                         "h2d_mib=%.2f miss_h2d_mib=%.2f overflow_waves=%llu staged_experts=%llu "
+                         "resident_reuse=%llu cpu_overflow=%llu cpu_ms_per_expert=%.4f h2d_gib_s=%.2f\n",
+                         (unsigned long long) hook->gpu_hits(), (unsigned long long) hook->gpu_hybrid_misses(),
+                         (unsigned long long) hook->gpu_cpu_misses(), double(h2d_bytes) / (1024.0 * 1024.0),
+                         double(hybrid_assigned_bytes) / (1024.0 * 1024.0), (unsigned long long) hybrid_overflow_waves,
+                         (unsigned long long) hybrid_staged_experts, (unsigned long long) hook->gpu_hits(),
+                         (unsigned long long) hook->gpu_cpu_misses(), hybrid_cpu_ms_per_expert,
+                         h2d_ns > 0 ? double(h2d_bytes) / double(h2d_ns) * 1e9 / (1024.0 * 1024.0 * 1024.0) : 0.0);
+        }
+        if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload && gpu_experts.buffer()) {
+            if (ctx) llama_synchronize(ctx.get());
+            const auto stats = gpu_experts.device_stats();
+            std::fprintf(stderr,
+                         "bmoe-gpu-lru: gpu_cache_hits=%llu gpu_cache_misses=%llu "
+                         "gpu_executed_misses=%llu cpu_executed_misses=%llu "
+                         "miss_upload_mib=%.2f stage_calls=%llu fill_metadata_d2h_bytes=%llu direct_host_calls=0\n",
+                         (unsigned long long) (stats.routed - stats.fills), (unsigned long long) stats.fills,
+                         (unsigned long long) gpu_stage_misses.load(std::memory_order_relaxed),
+                         (unsigned long long) (hook ? hook->gpu_cpu_misses() : 0),
+                         double(gpu_stage_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+                         (unsigned long long) gpu_stage_calls.load(std::memory_order_relaxed),
+                         (unsigned long long) gpu_fill_metadata_d2h_bytes.load(std::memory_order_relaxed));
+        }
         if (route_trace && !gpu_trace_events.empty())
             route_trace->on_gpu_events(gpu_trace_events.data(), gpu_trace_events.size());
+        if (gpu_experts.buffer() && hook)
+            std::fprintf(stderr, "bmoe-gpu-grouped: executions=%llu contributions=%llu fallbacks=%llu\n",
+                         (unsigned long long) hook->gpu_grouped_layers(),
+                         (unsigned long long) hook->gpu_grouped_contributions(),
+                         (unsigned long long) hook->gpu_grouped_fallbacks());
         if (gpu_experts.buffer() && hook)
             std::fprintf(stderr,
                          "bmoe-gpu-cache: gpu_expert_hits=%llu cpu_expert_misses=%llu gpu_promotions=%llu "
@@ -929,6 +1469,8 @@ struct Session::Impl {
         gpu_expert_layers.clear();
         gpu_expert_metadata.reset();
         gpu_experts.reset();
+        if (mtp_expert_bank) ggml_backend_buffer_free(mtp_expert_bank);
+        mtp_expert_bank = nullptr;
         hook.reset();
         model.reset();
         mapping_placeholders.release();
@@ -957,8 +1499,23 @@ size_t Session::physical_kv_bytes() const {
     return llama_get_kv_cache_size_bytes(impl_->ctx.get());
 }
 
+size_t Session::draft_kv_bytes() const {
+    return impl_->ctx_dft ? llama_get_kv_cache_size_bytes(impl_->ctx_dft.get()) : 0;
+}
+
+int Session::draft_kv_tokens() const {
+    return impl_->ctx_dft ? int(llama_get_kv_cache_capacity(impl_->ctx_dft.get())) : 0;
+}
+
+int Session::expert_performance_floor_mb() const {
+    return impl_->expert_performance_floor_mb();
+}
+
 int Session::kv_growth_count() const {
     return impl_->kv_growth_count;
+}
+size_t Session::gpu_expert_cache_bytes() const {
+    return impl_->gpu_experts.allocated_bytes();
 }
 int Session::n_expert_used() const {
     return impl_->n_expert_used;
@@ -1213,6 +1770,14 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     if (cfg.gpu.safety_mb < 128) return fail("gpu safety rail must be at least 128 MiB");
     if (cfg.gpu.expert_cache_mb > 0 && (!cfg.moe.enabled || cfg.gpu.n_gpu_layers != -1))
         return fail("GPU expert cache needs MoE streaming and full CUDA layer placement");
+    if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::DirectHost)
+        return fail("direct-host expert execution is unavailable: the discrete CUDA backend assigns host buffers "
+                    "to CPU and rejects them as MUL_MAT_ID GPU weights");
+    if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload &&
+        (cfg.gpu.n_gpu_layers != -1 || !cfg.moe.enabled ||
+         (!cfg.gpu.expert_cache_auto && cfg.gpu.expert_cache_mb <= 0) ||
+         (!cfg.moe.cache_auto && cfg.moe.cache_mb <= 0)))
+        return fail("upload expert misses require full CUDA MoE placement, a GPU expert pool, and a RAM expert cache");
     if (cfg.gpu.n_gpu_layers != 0 && cfg.prefill.enabled())
         return fail("GPU layer offload does not combine with prefill.device");
     const int tile = cfg.layer_tile_tokens;
@@ -1251,20 +1816,27 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
     std::unique_ptr<Session> self(new Session());
     Impl & im = *self->impl_;
     im.cfg = cfg;
+    if (cfg.gpu.expert_cache_auto && cfg.gpu.elastic_kv) {
+        // The auto pool trades smaller startup KV for more permanent expert slots.
+        // Logical n_ctx remains unchanged; the existing state-preserving grow path handles the chunks.
+        im.cfg.gpu.elastic_kv_chunk_tokens = std::min(cfg.gpu.elastic_kv_chunk_tokens, 8192);
+    }
     if (!cfg.agent_state_cache_path.empty()) {
         im.agent_cache.path = cfg.agent_state_cache_path;
         im.agent_cache.with_draft = cfg.spec.is_mtp();
-        im.agent_cache.key = agent_state_key(cfg);
+        im.agent_cache.key = agent_state_key(im.cfg);
         if (im.agent_cache.key == 0) return fail("agent state cache cannot identify the model file");
     }
     if (!cfg.claude_prefix_cache_path.empty()) {
         im.claude_cache.path = cfg.claude_prefix_cache_path;
         im.claude_cache.with_draft = cfg.spec.is_mtp();
-        const uint64_t model_key = agent_state_key(cfg);
+        const uint64_t model_key = agent_state_key(im.cfg);
         if (model_key == 0) return fail("Claude prefix cache cannot identify the model file");
         constexpr char format[] = "claude-bridge-prefix-v2|chat-template-v1";
         im.claude_cache.key = hash_bytes(model_key, format, sizeof(format) - 1);
     }
+    im.mid_prompt_cache.key = im.agent_cache.key ? im.agent_cache.key : im.claude_cache.key;
+    im.mid_prompt_cache.with_draft = cfg.spec.is_mtp();
 
     // llama_backend_init/free is process-global and reference counted; init here, free in ~Impl.
     llama_backend_init();
@@ -1319,13 +1891,17 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             return fail("requested GPU " + std::to_string(cfg.gpu.main_gpu) + " is unavailable (" +
                         std::to_string(gpus.size()) + " GPU device(s) found)");
         auto_devices = {gpus[(size_t) cfg.gpu.main_gpu], nullptr};
+        im.gpu_device = auto_devices[0];
         mparams.devices = auto_devices.data();
         mparams.main_gpu = 0; // the selected device is the only device passed to llama.cpp
         mparams.tensor_buft_overrides = expert_overrides;
         // A CUDA host buffer would allocate the entire CPU expert set. Keep CPU weights file-backed.
         mparams.no_host = true;
-        std::fprintf(stderr, "bmoe: CUDA hybrid requested: %s, gpu-layers=%d, routed experts on CPU\n",
-                     ggml_backend_dev_name(auto_devices[0]), cfg.gpu.n_gpu_layers);
+        std::fprintf(stderr, "bmoe: CUDA hybrid requested: %s, gpu-layers=%d, expert-miss-mode=%s\n",
+                     ggml_backend_dev_name(auto_devices[0]), cfg.gpu.n_gpu_layers,
+                     cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload   ? "upload"
+                     : cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid ? "hybrid"
+                                                                                                : "cpu");
     }
     if (cfg.prefill.enabled()) {
         std::string derr;
@@ -1458,7 +2034,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         break;
     }
     cparams.n_ctx = cfg.n_ctx;
-    cparams.n_kv = cfg.gpu.elastic_kv ? uint32_t(std::min(cfg.n_ctx, cfg.gpu.elastic_kv_chunk_tokens)) : 0;
+    cparams.n_kv = cfg.gpu.elastic_kv ? uint32_t(std::min(cfg.n_ctx, im.cfg.gpu.elastic_kv_chunk_tokens)) : 0;
     cparams.n_batch = cfg.n_batch;
     // The graph is reserved for the widest ubatch, so this is what sets the resident compute
     // buffers — the memory this engine is always short of. 0 keeps the historical behaviour
@@ -1700,24 +2276,62 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             im.source.set_row_tensors(std::move(rows), row_budget);
         }
 
-        if (cfg.gpu.expert_cache_mb > 0) {
+        if (cfg.spec.is_mtp() && cfg.gpu.n_gpu_layers == -1) {
+            std::string bank_error;
+            if (!im.bind_mtp_expert_bank(auto_devices[0], layers, bank_error))
+                return fail("GPU MTP expert bank: " + bank_error);
+        }
+
+        int pool_mb = cfg.gpu.expert_cache_mb;
+        if (cfg.gpu.expert_cache_auto) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(auto_devices[0], &free_bytes, &total_bytes);
+            const size_t current_kv = llama_get_kv_cache_size_bytes(im.ctx.get()) +
+                                      (im.ctx_dft ? llama_get_kv_cache_size_bytes(im.ctx_dft.get()) : 0);
+            const size_t next_growth =
+                cfg.gpu.elastic_kv && im.physical_kv_tokens < cfg.n_ctx
+                    ? current_kv * size_t(im.cfg.gpu.elastic_kv_chunk_tokens) / size_t(im.physical_kv_tokens)
+                    : 0;
+            const size_t reserve = size_t(cfg.gpu.safety_mb + 64) * 1024ull * 1024ull + next_growth;
+            if (!total_bytes || free_bytes <= reserve) return fail("GPU expert auto budget has no safe VRAM headroom");
+            pool_mb = int((free_bytes - reserve) / (16ull * 1024ull * 1024ull) * 16);
+            if (pool_mb <= 0) return fail("GPU expert auto budget is below one allocation unit");
+            std::fprintf(stderr,
+                         "bmoe-gpu-cache: auto_budget_mib=%d free_dedicated_mib=%.1f "
+                         "next_kv_growth_reserve_mib=%.1f runtime_reserve_mib=64 safety_mib=%d\n",
+                         pool_mb, double(free_bytes) / (1024.0 * 1024.0), double(next_growth) / (1024.0 * 1024.0),
+                         cfg.gpu.safety_mb);
+        }
+        if (pool_mb > 0) {
             std::string pool_error;
-            // The fixed GPU pool serves trunk experts; the extra MTP block still uses the RAM streamer.
+            // The fixed pool serves trunk experts; MTP owns a separate complete GPU bank.
             std::vector<LayerExperts> gpu_cache_layers = layers;
             if (cfg.spec.is_mtp())
                 for (size_t il = size_t(im.n_layer); il < gpu_cache_layers.size(); ++il)
                     gpu_cache_layers[il].bound = false;
-            if (!im.gpu_experts.init(auto_devices[0], cfg.gpu.expert_cache_mb, n_expert, gpu_cache_layers, pool_error,
-                                     cfg.gpu.safety_mb))
+            im.gpu_cache_layers = gpu_cache_layers;
+            im.gpu_cache_expert_count = n_expert;
+            im.gpu_pool_max_mb = pool_mb;
+            if (!im.gpu_experts.init(auto_devices[0], pool_mb, n_expert, gpu_cache_layers, pool_error,
+                                     cfg.gpu.safety_mb,
+                                     cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload))
                 return fail("GPU expert cache: " + pool_error);
+            im.gpu_pool_mb = pool_mb;
+            if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload &&
+                !im.gpu_experts.host_stage_available())
+                return fail("GPU expert upload mode requires mapped pinned host staging on this CUDA device");
             im.gpu_recent_miss.assign(layers.size() * size_t(n_expert), 0);
             im.gpu_queued.assign(layers.size() * size_t(n_expert), 0);
             ggml_init_params metadata_params{};
-            metadata_params.mem_size = ggml_tensor_overhead() * (layers.size() * 8 + 16);
+            metadata_params.mem_size = ggml_tensor_overhead() * (layers.size() * 16 + 16);
             metadata_params.no_alloc = true;
             im.gpu_expert_metadata.reset(ggml_init(metadata_params));
             if (!im.gpu_expert_metadata) return fail("GPU expert cache metadata allocation failed");
             im.gpu_expert_layers.resize(layers.size());
+            if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Upload) {
+                im.gpu_lru_layers.resize(layers.size());
+                im.gpu_stage_jobs.resize(layers.size());
+            }
             for (size_t il = 0; il < layers.size(); ++il) {
                 if (!gpu_cache_layers[il].bound) continue;
                 auto & descriptor = im.gpu_expert_layers[il];
@@ -1727,23 +2341,45 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
                 descriptor.host_table = im.gpu_experts.make_host_table(im.gpu_expert_metadata.get(), int(il));
                 descriptor.device_table = im.gpu_experts.make_device_table(im.gpu_expert_metadata.get(), int(il));
                 descriptor.dummy_slot = 0;
+                descriptor.overlap_cpu = cfg.gpu.expert_overlap;
                 if (!descriptor.gate || !descriptor.up || !descriptor.down || !descriptor.host_table ||
                     !descriptor.device_table)
                     return fail("GPU expert cache requires split gate/up/down tensors in every bound MoE layer");
+                if (!im.gpu_lru_layers.empty()) {
+                    auto & lru = im.gpu_lru_layers[il];
+                    lru = descriptor;
+                    lru.state = im.gpu_experts.make_device_state(im.gpu_expert_metadata.get(), int(il));
+                    lru.host_gate = im.gpu_experts.make_host_stage_tensor(im.gpu_expert_metadata.get(), int(il), 0);
+                    lru.host_up = im.gpu_experts.make_host_stage_tensor(im.gpu_expert_metadata.get(), int(il), 1);
+                    lru.host_down = im.gpu_experts.make_host_stage_tensor(im.gpu_expert_metadata.get(), int(il), 2);
+                    lru.n_expert = n_expert;
+                    lru.n_slots = im.gpu_experts.layers()[il].slot_count;
+                    lru.host_fill_list = im.gpu_experts.host_fill_list(int(il));
+                    im.gpu_stage_jobs[il] = {&im, int(il)};
+                    lru.stage_callback = &Impl::on_gpu_stage;
+                    lru.stage_user_data = &im.gpu_stage_jobs[il];
+                    if (!lru.state || !lru.host_gate || !lru.host_up || !lru.host_down || !lru.host_fill_list)
+                        return fail("GPU expert upload metadata allocation failed");
+                }
             }
             std::fprintf(stderr,
                          "bmoe: GPU expert cache bridge: %zu MiB reserved, "
-                         "%zu MiB slot layout, %zu real slots\n",
+                         "%zu MiB slot layout, %zu real slots, branch_overlap=%s\n",
                          im.gpu_experts.allocated_bytes() >> 20, im.gpu_experts.planned_bytes() >> 20,
-                         im.gpu_experts.capacity());
+                         im.gpu_experts.capacity(), cfg.gpu.expert_overlap ? "on" : "off");
         }
         if (im.prefill) im.prefill->keep_stream_layout(layers, offs.shard_paths);
         if (!im.source.init(offs.shard_paths, n_expert, std::move(layers), cfg.moe))
             return fail("expert stream source init failed");
         im.hook->set_source(&im.source);
-        if (cfg.gpu.expert_cache_mb > 0) {
+        if (pool_mb > 0) {
             im.hook->set_gpu_expert_pool(&im.gpu_experts);
-            if (cfg.gpu.expert_cache_promote) im.gpu_worker = std::thread([&im] { im.run_gpu_worker(); });
+            if (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid)
+                im.hook->set_hybrid_upload(&Impl::on_hybrid_upload, &im);
+            if (cfg.gpu.expert_cache_promote &&
+                (cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Cpu ||
+                 cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid))
+                im.gpu_worker = std::thread([&im] { im.run_gpu_worker(); });
         }
         // The row policy exists only once dense_.init has taken the tables over; null means nothing
         // qualified or the takeover declined, and the hook then costs exactly nothing per node.
@@ -1851,6 +2487,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         if (!cfg.moe.access_trace_path.empty() && !im.source.set_access_trace(cfg.moe.access_trace_path))
             return fail("could not open expert access trace");
         if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+        if (im.mtp) common_speculative_set_state(im.mtp.get(), 0, {});
     }
 
     if (im.prefill) {
@@ -2002,6 +2639,8 @@ RunResult Session::generate(const GenerateRequest & req,
                             const std::function<void(const TokenMetrics &)> & on_token,
                             IMetricsSink * sink) {
     Impl & im = *impl_;
+    im.context_pressure = false;
+    im.pressure_required_tokens = 0;
     const MoeStreamConfig & moe = im.cfg.moe;
     llama_context * ctx = im.ctx.get();
 
@@ -2025,6 +2664,13 @@ RunResult Session::generate(const GenerateRequest & req,
     auto fail = [&](std::string msg) {
         res.ok = false;
         res.error = std::move(msg);
+        if (im.context_pressure) {
+            res.context_pressure = true;
+            res.required_kv_tokens = im.pressure_required_tokens;
+            res.current_kv_tokens = im.physical_kv_tokens;
+            res.expert_floor_mb = im.expert_performance_floor_mb();
+            res.expert_cache_mb = im.gpu_pool_mb;
+        }
         return res;
     };
 
@@ -2056,6 +2702,8 @@ RunResult Session::generate(const GenerateRequest & req,
     // Format the prompt. With chat on, render the model's OWN chat template (real Jinja) over the
     // WHOLE conversation so far, and set up reasoning parsing so a thinking model's internal
     // reasoning is stripped from the shown answer. req.think drives enable_thinking, per prompt.
+    const bool structured_chat = !req.messages_json.empty();
+    if (structured_chat && !im.chat_on) return fail("structured chat requires --chatml and a model chat template");
     std::string prompt = req.prompt;
     bool chat_on = im.chat_on;
     bool history_pushed = false;   // did we append this turn's user message to chat_history?
@@ -2063,22 +2711,35 @@ RunResult Session::generate(const GenerateRequest & req,
     common_chat_parser_params parse_params;
     if (chat_on) {
         try {
-            common_chat_msg user_msg;
-            user_msg.role = "user";
-            user_msg.content = req.prompt;
-            im.chat_history.push_back(user_msg);
-            history_pushed = true;
+            if (structured_chat) {
+                im.chat_history = common_chat_msgs_parse_oaicompat(common_json::parse(req.messages_json));
+                if (im.chat_history.empty()) return fail("structured chat messages must not be empty");
+            } else {
+                common_chat_msg user_msg;
+                user_msg.role = "user";
+                user_msg.content = req.prompt;
+                im.chat_history.push_back(user_msg);
+                history_pushed = true;
+            }
 
             // The full conversation, not just this turn. The reasoning span and the turn header a
             // prefilled turn resumes after are rendered by llama.cpp's own handler for this
             // template, so no marker for any family is spelled out here. See thinking_control.h.
             common_chat_templates_inputs inputs;
-            prefilled_answer = detail::build_turn_inputs(inputs, im.chat_history, req.think, im.think_ctl);
+            prefilled_answer = detail::build_turn_inputs(inputs, im.chat_history, req.think,
+                                                         structured_chat ? ThinkControl::Template : im.think_ctl);
+            if (structured_chat) {
+                inputs.tools = common_chat_tools_parse_oaicompat(
+                    req.tools_json.empty() ? common_json::array() : common_json::parse(req.tools_json));
+                inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(req.tool_choice);
+                inputs.parallel_tool_calls = req.parallel_tool_calls;
+            }
 
             common_chat_params cp = common_chat_templates_apply(im.chat_tmpls.get(), inputs);
             prompt = cp.prompt;
             parse_params = detail::build_parse_params(cp);
         } catch (const std::exception & e) {
+            if (structured_chat) return fail(std::string("structured chat template failed: ") + e.what());
             std::fprintf(stderr, "bmoe: chat template apply failed (%s); using raw prompt\n", e.what());
             if (history_pushed) {
                 im.chat_history.pop_back();
@@ -2197,40 +2858,90 @@ RunResult Session::generate(const GenerateRequest & req,
         const auto t_restore = clock_t_::now();
         const size_t rolling_match = req.claude_prewarm ? 0 : im.agent_cache.match_count(tokens);
         const size_t claude_match = im.claude_cache.match_count(tokens);
+        const size_t mid_match = req.claude_prewarm ? 0 : im.mid_prompt_cache.match_count(tokens);
         if (im.agent_cache.disk_rejected)
             std::fprintf(stderr, "bmoe: rolling agent state cache rejected incompatible or corrupt snapshot\n");
         if (im.claude_cache.disk_rejected)
             std::fprintf(stderr, "bmoe: Claude prefix cache rejected incompatible or corrupt snapshot\n");
         im.agent_cache.disk_rejected = false;
         im.claude_cache.disk_rejected = false;
-        AgentStateCache * first = claude_match > rolling_match ? &im.claude_cache : &im.agent_cache;
-        AgentStateCache * second = first == &im.claude_cache ? &im.agent_cache : &im.claude_cache;
-        for (AgentStateCache * candidate : {first, second}) {
-            if (req.claude_prewarm && candidate == &im.agent_cache) continue;
+        std::vector<AgentStateCache *> candidates = {&im.agent_cache, &im.claude_cache, &im.mid_prompt_cache};
+        std::stable_sort(candidates.begin(), candidates.end(), [&](const auto * a, const auto * b) {
+            const auto match = [&](const auto * c) {
+                if (c == &im.agent_cache) return rolling_match;
+                if (c == &im.claude_cache) return claude_match;
+                return mid_match;
+            };
+            return match(a) > match(b);
+        });
+        for (AgentStateCache * candidate : candidates) {
+            if (req.claude_prewarm && candidate != &im.claude_cache) continue;
             if (!candidate->match_count(tokens)) continue;
-            const size_t restored = candidate->restore(ctx, im.ctx_dft.get(), tokens);
+            // A saved prefix can exceed a fresh Elastic-KV context's physical capacity.
+            // Grow before deserialization, or a valid on-disk state is falsely rejected.
+            if (im.cfg.gpu.elastic_kv && candidate->tokens.size() > size_t(im.physical_kv_tokens)) {
+                std::string growth_error;
+                if (!im.ensure_kv_capacity(int(candidate->tokens.size()), growth_error)) return fail(growth_error);
+                ctx = im.ctx.get();
+            }
+            const size_t restored = candidate->restore(ctx, im.ctx_dft.get(), im.mtp.get(), tokens);
             if (restored && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == llama_pos(restored - 1) &&
-                (!im.ctx_dft || llama_memory_seq_pos_max(llama_get_memory(im.ctx_dft.get()), 0) ==
-                                    llama_pos(restored - 1))) {
+                (!im.ctx_dft ||
+                 llama_memory_seq_pos_max(llama_get_memory(im.ctx_dft.get()), 0) == llama_pos(restored - 1))) {
                 n_common = restored;
                 if (chat_on) im.kv_tokens = candidate->tokens;
                 std::fprintf(stderr, "bmoe: %s cache hit: %zu tokens, suffix %zu tokens, %.1f MiB, restore %.3f s\n",
-                             candidate == &im.claude_cache ? "Claude prefix" : "rolling agent state", restored,
-                             tokens.size() - restored, double(candidate->state.size()) / (1024.0 * 1024.0),
+                             candidate == &im.claude_cache       ? "Claude prefix"
+                             : candidate == &im.mid_prompt_cache ? "mid-prompt"
+                                                                 : "rolling agent state",
+                             restored, tokens.size() - restored, double(candidate->state.size()) / (1024.0 * 1024.0),
                              secs(t_restore, clock_t_::now()));
                 break;
             }
             im.clear_memory(ctx);
             if (im.ctx_dft) llama_memory_clear(llama_get_memory(im.ctx_dft.get()), true);
+            if (im.mtp) common_speculative_set_state(im.mtp.get(), 0, {});
             candidate->state.clear();
             candidate->draft_state.clear();
+            candidate->speculative_state.clear();
             candidate->tokens.clear();
             std::fprintf(stderr, "bmoe: %s cache rejected invalid restored state; trying next exact prefix\n",
-                         candidate == &im.claude_cache ? "Claude prefix" : "rolling agent state");
+                         candidate == &im.claude_cache       ? "Claude prefix"
+                         : candidate == &im.mid_prompt_cache ? "mid-prompt"
+                                                             : "rolling agent state");
         }
         if (!n_common && claude_checkpoint)
             std::fprintf(stderr, "bmoe: Claude prefix cache miss: candidate %zu tokens; exact cold prefill\n",
                          claude_checkpoint);
+    }
+
+    // Rebalance only between requests, after prefix rewinds/restores and before any new graph runs.
+    if (im.cfg.gpu.elastic_kv && im.gpu_device && im.gpu_pool_mb > 0) {
+        const int chunk = im.cfg.gpu.elastic_kv_chunk_tokens;
+        const int needed = std::max(n_prompt + req.n_predict + 8, int(n_common) + 1);
+        const int rounded = int((int64_t(needed) + chunk - 1) / chunk * chunk);
+        const int target = rounded <= im.physical_kv_tokens - 2 * chunk ? rounded : im.physical_kv_tokens;
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_memory(im.gpu_device, &free_bytes, &total_bytes);
+        if (total_bytes) {
+            const size_t current_kv =
+                llama_get_kv_cache_size_bytes(ctx) + (im.ctx_dft ? llama_get_kv_cache_size_bytes(im.ctx_dft.get()) : 0);
+            const size_t released =
+                target < im.physical_kv_tokens
+                    ? current_kv * size_t(im.physical_kv_tokens - target) / size_t(im.physical_kv_tokens)
+                    : 0;
+            const size_t safety = size_t(im.cfg.gpu.safety_mb) * 1024ull * 1024ull;
+            // Regrowth is optional; leave room for CUDA allocation rounding and graph reservation.
+            const size_t reserve = safety + 64ull * 1024ull * 1024ull;
+            const size_t available = free_bytes + released > reserve ? free_bytes + released - reserve : 0;
+            const int grow_mb = int(std::min<size_t>(size_t(im.gpu_pool_max_mb - im.gpu_pool_mb), available >> 20));
+            if (target < im.physical_kv_tokens || grow_mb > 0) {
+                std::string resize_error;
+                if (!im.resize_kv_and_gpu_cache(target, im.gpu_pool_mb + grow_mb, resize_error))
+                    return fail(resize_error);
+                ctx = im.ctx.get();
+            }
+        }
     }
 
     // Roll this turn back to the state before it started: drop the KV added this turn, forget the
@@ -2343,13 +3054,24 @@ RunResult Session::generate(const GenerateRequest & req,
     const size_t checkpoint = req.claude_prewarm || im.agent_cache.key == 0 || n_prompt <= 128 ? 0
                               : n_prompt > 1024 ? size_t((n_prompt - 1) / 512 * 512)
                                                 : size_t((n_prompt - 1) / 64 * 64);
+    constexpr size_t mid_checkpoint = 4096;
+    const bool capture_mid = !req.claude_prewarm && im.mid_prompt_cache.key && size_t(n_prompt) > mid_checkpoint &&
+                             checkpoint > mid_checkpoint;
     for (int i = (int) n_common; i < n_prompt;) {
         int chunk = std::min(pf_step, n_prompt - i);
         if (checkpoint > size_t(i) && checkpoint < size_t(i + chunk)) chunk = int(checkpoint) - i;
         if (claude_checkpoint > size_t(i) && claude_checkpoint < size_t(i + chunk)) chunk = int(claude_checkpoint) - i;
+        if (capture_mid && mid_checkpoint > size_t(i) && mid_checkpoint < size_t(i + chunk))
+            chunk = int(mid_checkpoint) - i;
         if (im.cfg.gpu.elastic_kv) {
             std::string growth_error;
-            if (!im.ensure_kv_capacity(i + chunk, growth_error)) return fail(growth_error);
+            if (!im.ensure_kv_capacity(i + chunk, growth_error)) {
+                if (im.context_pressure) {
+                    ctx = im.ctx.get();
+                    rollback_turn();
+                }
+                return fail(growth_error);
+            }
             ctx = im.ctx.get();
         }
         if (im.prefill) {
@@ -2384,18 +3106,25 @@ RunResult Session::generate(const GenerateRequest & req,
         if (mtp_on && !common_speculative_process(im.mtp.get(), pf))
             return fail("MTP draft context failed to process the prefill batch");
         i += chunk;
+        if (capture_mid && size_t(i) == mid_checkpoint)
+            im.mid_prompt_cache.capture(ctx, im.ctx_dft.get(), im.mtp.get(), tokens, mid_checkpoint);
         if (checkpoint != 0 && size_t(i) == checkpoint) {
             const auto t_capture = clock_t_::now();
-            if (im.agent_cache.capture(ctx, im.ctx_dft.get(), tokens, checkpoint))
+            if (im.agent_cache.capture(ctx, im.ctx_dft.get(), im.mtp.get(), tokens, checkpoint))
                 std::fprintf(stderr, "bmoe: agent state cache checkpoint: %zu tokens, %.1f MiB, capture %.3f s\n",
                              checkpoint, double(im.agent_cache.state.size()) / (1024.0 * 1024.0),
                              secs(t_capture, clock_t_::now()));
         }
         if (claude_checkpoint != 0 && size_t(i) == claude_checkpoint &&
-            im.claude_cache.capture(ctx, im.ctx_dft.get(), tokens, claude_checkpoint))
+            im.claude_cache.capture(ctx, im.ctx_dft.get(), im.mtp.get(), tokens, claude_checkpoint))
             std::fprintf(stderr, "bmoe: Claude prefix cache checkpoint: %zu tokens, suffix %zu tokens, %.1f MiB\n",
                          claude_checkpoint, tokens.size() - claude_checkpoint,
                          double(im.claude_cache.state.size()) / (1024.0 * 1024.0));
+    }
+    if (req.clear_kv) {
+        std::fprintf(stderr, "bmoe-prompt-reuse: previous=%zu new=%d reused=%zu replayed=%zu\n",
+                     im.previous_prompt_tokens, n_prompt, n_common, size_t(n_prompt) - n_common);
+        im.previous_prompt_tokens = size_t(n_prompt);
     }
     im.place_prefill(false); // decode reads the host bindings
     const long long prefill_device_nodes = im.hook->device_nodes() - device_nodes0;
@@ -2476,6 +3205,14 @@ RunResult Session::generate(const GenerateRequest & req,
     const long long mtp0_drafted_steps = im.drafted_steps;
     const double mtp0_draft_s = im.mtp_draft_seconds;
     const uint64_t mtp0_draft_bytes = im.mtp_draft_read_bytes;
+    const int mtp0_cost_truncations = im.mtp_width.cost_truncations;
+    const int mtp0_cost_probes = im.mtp_width.cost_probes;
+    std::array<uint64_t, AdaptiveMtpWidth::max_width + 2> mtp_verify_width_hist{};
+    uint64_t mtp_proposed_drafts = 0;
+    uint64_t mtp_selected_drafts = 0;
+    uint64_t mtp_unique_lookups = 0;
+    uint64_t mtp_cache_misses = 0;
+    uint64_t mtp_cpu_fallback = 0;
 
     // The token the last decode settled on, not yet in the KV. Greedy stays argmax (byte-identical
     // to the resident reference the gates check); with a sampling chain, draw from the context's
@@ -2490,7 +3227,13 @@ RunResult Session::generate(const GenerateRequest & req,
             const int remaining_draft = spec_on ? std::min(im.cfg.spec.draft_max, req.n_predict - n_gen - 1) : 0;
             const int growth_before = im.kv_growth_count;
             std::string growth_error;
-            if (!im.ensure_kv_capacity(n_past + 1 + remaining_draft, growth_error)) return fail(growth_error);
+            if (!im.ensure_kv_capacity(n_past + 1 + remaining_draft, growth_error)) {
+                if (im.context_pressure) {
+                    ctx = im.ctx.get();
+                    rollback_turn();
+                }
+                return fail(growth_error);
+            }
             ctx = im.ctx.get();
             if (mtp_on && im.kv_growth_count != growth_before)
                 common_speculative_begin(im.mtp.get(), /*seq_id*/ 0, mtp_ctx);
@@ -2501,6 +3244,8 @@ RunResult Session::generate(const GenerateRequest & req,
         // draft accepted past n_predict would be verified, charged for, and then discarded. The cap
         // goes in BEFORE drafting, so no source is ever asked for tokens with nowhere to go.
         int n_draft = 0;
+        int requested_mtp_width = 0;
+        int proposed_mtp_width = 0;
         double draft_s = 0.0;                       // this group's drafting + catch-up (see below)
         const int room = req.n_predict - n_gen - 1; // tokens still wanted after `tok` itself
         if (spec_on && room > 0) {
@@ -2511,7 +3256,11 @@ RunResult Session::generate(const GenerateRequest & req,
                 llama_synchronize(ctx);
                 common_speculative_draft_params & dp = common_speculative_get_draft_params(im.mtp.get(), /*seq*/ 0);
                 dp.drafting = true;
-                dp.n_max = std::min(im.cfg.spec.draft_max, room);
+                requested_mtp_width = im.cfg.spec.adaptive_mtp ? im.mtp_width.request(im.cfg.spec.draft_max, room,
+                                                                                      im.cfg.spec.mtp_cost_explore)
+                                                               : std::min(im.cfg.spec.draft_max, room);
+                proposed_mtp_width = im.cfg.spec.adaptive_mtp ? im.mtp_width.last_proposed : requested_mtp_width;
+                dp.n_max = requested_mtp_width;
                 dp.pos0 = n_past; // upstream renamed n_past -> pos0 (#28715); text-only, so the same value
                 dp.id_last = tok;
                 dp.prompt = &mtp_ctx;
@@ -2569,6 +3318,9 @@ RunResult Session::generate(const GenerateRequest & req,
         // compute residual into flash-fault stalls vs. genuine (or throttled) computation.
         const uint64_t f0 = pio::major_faults();
         const double c0 = pio::process_cpu_seconds();
+        const auto verify_stats0 = moe.enabled ? im.source.stats() : IExpertSource::Stats{};
+        const uint64_t verify_cpu_fallback0 = im.hook ? im.hook->gpu_cpu_misses() : 0;
+        const uint64_t verify_hybrid_gpu0 = im.hook ? im.hook->gpu_hybrid_misses() : 0;
         auto s0 = clock_t_::now();
         const double overhead = secs(loop_mark, s0); // everything since the previous decode returned
         loop_overhead_s += overhead;
@@ -2588,6 +3340,23 @@ RunResult Session::generate(const GenerateRequest & req,
         }
         trace_flush(); // outside the s0..s1 bracket: the trace's own writes must not bill wall_ms
         ++im.mtp_decodes;
+        const auto verify_stats1 = moe.enabled ? im.source.stats() : IExpertSource::Stats{};
+        const uint64_t unique_lookups =
+            uint64_t(std::max(0LL, verify_stats1.cache_lookups - verify_stats0.cache_lookups));
+        const uint64_t cache_hits = uint64_t(std::max(0LL, verify_stats1.cache_hits - verify_stats0.cache_hits));
+        const uint64_t cpu_fallback = im.hook ? im.hook->gpu_cpu_misses() - verify_cpu_fallback0 : 0;
+        if (im.cfg.gpu.expert_miss_mode == RunConfig::GpuConfig::ExpertMissMode::Hybrid && cpu_fallback > 0 &&
+            im.hook->gpu_hybrid_misses() == verify_hybrid_gpu0) {
+            const double stall_ms = std::max(0.0, (verify_stats1.stall_seconds - verify_stats0.stall_seconds) * 1000.0);
+            const double cpu_ms = std::max(0.0, secs(s0, s1) * 1000.0 - stall_ms) * std::max(1, im.cfg.n_threads);
+            const double sample_ms = cpu_ms / cpu_fallback;
+            im.hybrid_cpu_ms_per_expert =
+                im.hybrid_cpu_ms_per_expert > 0.0 ? 0.75 * im.hybrid_cpu_ms_per_expert + 0.25 * sample_ms : sample_ms;
+        }
+        MtpVerifyCost verify_cost{secs(s0, s1) * 1000.0,
+                                  std::max(0.0, (verify_stats1.stall_seconds - verify_stats0.stall_seconds) * 1000.0),
+                                  double(unique_lookups), double(unique_lookups - std::min(unique_lookups, cache_hits)),
+                                  double(cpu_fallback)};
 
         // ── accept ──
         // `tok` was settled before the decode, so it is confirmed unconditionally. Each draft is
@@ -2610,6 +3379,14 @@ RunResult Session::generate(const GenerateRequest & req,
         }
         if (spec_on) {
             im.mtp_accepted += n_acc;
+            if (mtp_on) {
+                mtp_proposed_drafts += proposed_mtp_width;
+                mtp_selected_drafts += requested_mtp_width;
+                ++mtp_verify_width_hist[size_t(1 + n_draft)];
+                mtp_unique_lookups += unique_lookups;
+                mtp_cache_misses += unique_lookups - std::min(unique_lookups, cache_hits);
+                mtp_cpu_fallback += cpu_fallback;
+            }
 
             // Catch the draft context up on the ACCEPTED PREFIX ONLY.
             //
@@ -2650,6 +3427,10 @@ RunResult Session::generate(const GenerateRequest & req,
                     return fail("failed to roll back the rejected draft tokens from the KV cache");
             }
             if (mtp_on) common_speculative_accept(im.mtp.get(), /*seq*/ 0, (uint16_t) n_acc);
+            if (mtp_on && im.cfg.spec.adaptive_mtp) {
+                verify_cost.draft_ms = draft_s * 1000.0;
+                im.mtp_width.observe(requested_mtp_width, n_draft, n_acc, im.cfg.spec.draft_max, verify_cost);
+            }
         }
 
         // ── emit ──
@@ -2818,6 +3599,34 @@ RunResult Session::generate(const GenerateRequest & req,
     s.drafted_steps = im.drafted_steps - mtp0_drafted_steps;
     s.mtp_draft_s_per_token = n_gen > 0 ? (im.mtp_draft_seconds - mtp0_draft_s) / n_gen : 0.0;
     s.mtp_draft_read_mib = (double) (im.mtp_draft_read_bytes - mtp0_draft_bytes) / (1024.0 * 1024.0);
+    if (mtp_on) {
+        std::fprintf(stderr,
+                     "bmoe-mtp: draft_policy=%s draft_ceiling=%d final_width=%d max_requested_width=%d "
+                     "width_increases=%d width_decreases=%d mtp_draft_read_mib=%.3f "
+                     "resident_layers=%d resident_tensors=%d resident_mib=%.1f\n",
+                     im.cfg.spec.adaptive_mtp ? "adaptive" : "fixed", im.cfg.spec.draft_max,
+                     im.cfg.spec.adaptive_mtp ? im.mtp_width.width : im.cfg.spec.draft_max,
+                     im.cfg.spec.adaptive_mtp ? im.mtp_width.max_requested : im.cfg.spec.draft_max,
+                     im.mtp_width.increases, im.mtp_width.decreases, s.mtp_draft_read_mib, im.mtp_expert_bank_layers,
+                     im.mtp_expert_bank_tensors, double(im.mtp_expert_bank_bytes) / (1024.0 * 1024.0));
+        std::string width_hist;
+        for (size_t width = 1; width < mtp_verify_width_hist.size(); ++width) {
+            if (mtp_verify_width_hist[width] == 0) continue;
+            if (!width_hist.empty()) width_hist += ',';
+            width_hist += std::to_string(width) + ':' + std::to_string(mtp_verify_width_hist[width]);
+        }
+        std::fprintf(stderr,
+                     "bmoe-mtp-cost: proposed_drafts=%llu selected_drafts=%llu cost_truncations=%d "
+                     "cost_explore=%s cost_probes=%d "
+                     "verify_width_hist=%s unique_lookups=%llu cache_misses=%llu "
+                     "cpu_fallback_contrib=%llu accepted_per_verify=%.3f\n",
+                     (unsigned long long) mtp_proposed_drafts, (unsigned long long) mtp_selected_drafts,
+                     im.mtp_width.cost_truncations - mtp0_cost_truncations, im.cfg.spec.mtp_cost_explore ? "on" : "off",
+                     im.mtp_width.cost_probes - mtp0_cost_probes, width_hist.c_str(),
+                     (unsigned long long) mtp_unique_lookups, (unsigned long long) mtp_cache_misses,
+                     (unsigned long long) mtp_cpu_fallback,
+                     s.mtp_decodes > 0 ? double(s.mtp_accepted) / double(s.mtp_decodes) : 0.0);
+    }
     if (moe.predict_log) {
         // Session totals, not a per-generation delta: these are an accuracy estimate, and every
         // turn's routings are equally valid samples of it. See RunSummary.
@@ -2854,17 +3663,24 @@ RunResult Session::generate(const GenerateRequest & req,
             final_msg = common_chat_parse(gen, /*is_partial*/ false, parse_params);
             final_parsed = true;
         } catch (const std::exception & e) {
+            if (structured_chat) return fail(std::string("structured chat parse failed: ") + e.what());
             detail::warn_parse_failed_once(e.what());
         }
     }
+    if (structured_chat) res.raw_generated_text = gen;
     if (final_parsed) {
         res.generated_text = final_msg.content;
         res.reasoning_text = final_msg.reasoning_content;
+        if (structured_chat) {
+            for (const auto & call : final_msg.tool_calls)
+                res.tool_calls.push_back({call.name, call.arguments, call.id});
+        }
     } else {
         // Not chat, a prefilled turn (the stream IS the answer), or a parse that threw: the raw
         // generation stands on its own, exactly as shown_view would have reported it.
         res.generated_text = gen;
     }
+    res.stop_reason = res.cancelled ? "cancelled" : n_gen >= req.n_predict ? "length" : "end_turn";
 
     if (res.cancelled) {
         // Undo the whole turn (KV, fed tokens, and the pushed user message) so the conversation
