@@ -63,6 +63,10 @@ weighting. GPU-owned dense weights are left under llama.cpp's backend instead of
 into host anonymous memory. The opt-in mixed graph needs the narrow pinned-fork extension in
 [seam.md](seam.md).
 The CUDA placement and its current restrictions are described in [cuda-hybrid.md](cuda-hybrid.md).
+Elastic-KV resizing snapshots the target and MTP states before releasing contexts. If a replacement
+step fails, the session recreates the previous physical KV capacity and GPU expert pool, restores
+both contexts and the MTP driver's pending state, and checks recovery before serving another turn.
+An incomplete rollback leaves the session context unavailable and reports a fatal error.
 
 ## Why the streaming seam needs no fork
 

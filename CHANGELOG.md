@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.37.1] - 2026-10-18
+
+### Fixed
+- Restore the prior physical KV configuration, sequence state, MTP driver state, and GPU expert
+  pool configuration after a failed elastic-KV recreation. Report both the resize error and an
+  explicit fatal rollback error if recovery cannot complete.
+
 ## [0.37.0] - 2026-10-17
 
 ### Added

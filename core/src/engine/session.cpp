@@ -1164,10 +1164,19 @@ struct Session::Impl {
             std::string release_error;
             rebuild_gpu_expert_pool(0, release_error);
         }
-        auto recreate = [&](uint32_t capacity) -> bool {
+        auto recreate = [&](uint32_t capacity, bool replacement, std::string & cause) -> bool {
+            auto fail_step = [&](const char * step) {
+                if (!replacement || !cfg.elastic_kv_fail_step || !cfg.elastic_kv_fail_step(step)) return false;
+                cause = std::string("injected failure at ") + step;
+                return true;
+            };
             context_params.n_kv = capacity;
             ctx.reset(llama_init_from_model(model.get(), context_params));
-            if (!ctx) return false;
+            if (!ctx) {
+                cause = "target context creation failed";
+                return false;
+            }
+            if (fail_step("target_create")) return false;
             llama_set_n_threads(ctx.get(), cfg.n_threads, cfg.n_threads);
             llama_set_abort_callback(
                 ctx.get(),
@@ -1176,7 +1185,11 @@ struct Session::Impl {
                     return p->cancel_requested.load(std::memory_order_relaxed) || p->source.fatal();
                 },
                 this);
-            if (bytes && llama_state_seq_set_data(ctx.get(), state.data(), bytes, 0) != bytes) return false;
+            if (bytes && llama_state_seq_set_data(ctx.get(), state.data(), bytes, 0) != bytes) {
+                cause = "target state restore failed";
+                return false;
+            }
+            if (fail_step("target_restore")) return false;
             if (cfg.spec.is_mtp()) {
                 llama_context_params dparams = context_params;
                 dparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -1186,22 +1199,37 @@ struct Session::Impl {
                 dparams.n_ubatch = uint32_t(std::max(cfg.spec.draft_max + 1, mtp_draft_ubatch));
                 dparams.n_ubatch = std::min(dparams.n_ubatch, context_params.n_ubatch);
                 ctx_dft.reset(llama_init_from_model(model.get(), dparams));
-                if (!ctx_dft) return false;
+                if (!ctx_dft) {
+                    cause = "draft context creation failed";
+                    return false;
+                }
+                if (fail_step("draft_create")) return false;
                 llama_set_n_threads(ctx_dft.get(), cfg.n_threads, cfg.n_threads);
                 if (!draft_state.empty() && llama_state_seq_set_data(ctx_dft.get(), draft_state.data(),
-                                                                     draft_state.size(), 0) != draft_state.size())
+                                                                     draft_state.size(), 0) != draft_state.size()) {
+                    cause = "draft state restore failed";
                     return false;
-                if (!init_mtp_driver()) return false;
+                }
+                if (fail_step("draft_restore")) return false;
+                if (!init_mtp_driver()) {
+                    cause = "MTP driver creation failed";
+                    return false;
+                }
+                if (fail_step("mtp_create")) return false;
                 common_speculative_set_state(mtp.get(), 0, speculative_state);
                 std::vector<uint8_t> restored_speculative;
                 if (!common_speculative_get_state(mtp.get(), 0, restored_speculative) ||
-                    restored_speculative != speculative_state)
+                    restored_speculative != speculative_state) {
+                    cause = "MTP driver state restore failed";
                     return false;
+                }
+                if (fail_step("mtp_restore")) return false;
             }
             return true;
         };
 
-        bool resized = recreate(uint32_t(target));
+        std::string resize_error;
+        bool resized = recreate(uint32_t(target), true, resize_error);
         std::string pool_error;
         auto rebuild_with_rail = [&](int requested_mb) {
             for (int candidate = requested_mb, tries = 0; candidate >= minimum_pool_mb && tries < 8;
@@ -1213,7 +1241,14 @@ struct Session::Impl {
             }
             return false;
         };
-        if (resized && target_pool_mb != old_pool_mb) resized = rebuild_with_rail(target_pool_mb);
+        if (resized && target_pool_mb != old_pool_mb) {
+            resized = rebuild_with_rail(target_pool_mb);
+            if (!resized) resize_error = "GPU expert pool recreation failed: " + pool_error;
+        }
+        if (resized && cfg.elastic_kv_fail_step && cfg.elastic_kv_fail_step("after_recreation")) {
+            resized = false;
+            resize_error = "injected failure at after_recreation";
+        }
         if (resized && gpu_device) {
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(gpu_device, &free_bytes, &total_bytes);
@@ -1229,26 +1264,32 @@ struct Session::Impl {
             }
             resized = total_bytes && free_bytes >= safety && (gpu_pool_mb == 0 || gpu_experts.buffer());
             if (!resized && pool_error.empty()) pool_error = "dedicated-VRAM safety rail could not be preserved";
+            if (!resized) resize_error = "GPU memory safety rail failed: " + pool_error;
         }
         if (!resized) {
             mtp.reset();
             ctx_dft.reset();
             ctx.reset();
-            if (gpu_pool_mb != old_pool_mb || !gpu_experts.buffer()) {
-                std::string restore_error;
-                if (!rebuild_gpu_expert_pool(old_pool_mb, restore_error)) {
-                    // Preserve the sequence even if another process consumed the old cache's VRAM.
-                    rebuild_gpu_expert_pool(0, restore_error);
-                    pool_error += "; previous GPU cache could not be restored: " + restore_error;
-                }
-            }
-            const bool restored = recreate(old_capacity);
+            std::string restore_error;
+            bool pool_restored = true;
+            if (gpu_pool_mb != old_pool_mb || (old_pool_mb && !gpu_experts.buffer()))
+                pool_restored = rebuild_gpu_expert_pool(old_pool_mb, restore_error);
+            const bool restored = pool_restored && recreate(old_capacity, false, restore_error);
+            const bool capacity_restored =
+                restored && int(llama_get_kv_cache_capacity(ctx.get())) == physical_kv_tokens;
             gpu_graph_attached = false;
             gpu_owned_graph = false;
             if (hook) hook->reset_gpu_graph_discovery();
-            error = restored ? "elastic KV/cache resize failed; previous sequence restored"
-                             : "elastic KV/cache resize failed and previous sequence could not be restored";
-            if (!pool_error.empty()) error += ": " + pool_error;
+            error = "elastic KV/cache resize failed: " + resize_error;
+            if (capacity_restored)
+                error += "; previous sequence restored";
+            else {
+                mtp.reset();
+                ctx_dft.reset();
+                ctx.reset();
+                error += "; fatal rollback failure: " +
+                         (restore_error.empty() ? "previous physical KV capacity was not restored" : restore_error);
+            }
             return false;
         }
         gpu_graph_attached = false;

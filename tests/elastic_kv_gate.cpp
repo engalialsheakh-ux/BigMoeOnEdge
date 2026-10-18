@@ -8,6 +8,72 @@
 #include <filesystem>
 #include <string>
 
+static int rollback_gate(const char * model_path) {
+    bmoe::RunConfig cfg;
+    cfg.model_path = model_path;
+    cfg.n_ctx = 1024;
+    cfg.n_ubatch = 64;
+    cfg.chatml = true;
+    cfg.moe.enabled = true;
+    cfg.moe.cache_mb = 8;
+    cfg.gpu.n_gpu_layers = -1;
+    cfg.gpu.expert_cache_mb = 16;
+    cfg.gpu.expert_miss_mode = bmoe::RunConfig::GpuConfig::ExpertMissMode::Upload;
+    cfg.gpu.safety_mb = 128;
+    cfg.gpu.elastic_kv = true;
+    cfg.gpu.elastic_kv_chunk_tokens = 512;
+    cfg.gpu.cache_type_k = bmoe::RunConfig::GpuConfig::KvCacheType::Q4_0;
+    cfg.gpu.cache_type_v = bmoe::RunConfig::GpuConfig::KvCacheType::Q4_0;
+    bmoe::GenerateRequest first;
+    first.prompt = std::string(200, 'a');
+    first.n_predict = 4;
+    first.render_text = false;
+    bmoe::GenerateRequest growth = first;
+    growth.prompt = std::string(350, 'b');
+    growth.clear_kv = false;
+    bmoe::GenerateRequest continuation = first;
+    continuation.prompt = "short continuation";
+    continuation.clear_kv = false;
+
+    for (const char * stage : {"target_restore", "after_recreation"}) {
+        std::string error;
+        auto reference = bmoe::Session::open(bmoe::session_config_from(cfg), error);
+        auto injected_cfg = bmoe::session_config_from(cfg);
+        int failures = 0;
+        injected_cfg.elastic_kv_fail_step = [&](const char * step) {
+            if (failures || std::string(step) != stage) return false;
+            ++failures;
+            return true;
+        };
+        auto session = bmoe::Session::open(injected_cfg, error);
+        const auto ref_first = reference ? reference->generate(first) : bmoe::RunResult{};
+        const auto got_first = session ? session->generate(first) : bmoe::RunResult{};
+        const int old_kv = session ? session->physical_kv_tokens() : 0;
+        const size_t old_bytes = session ? session->physical_kv_bytes() : 0;
+        const size_t old_pool = session ? session->gpu_expert_cache_bytes() : 0;
+        const auto failed = session ? session->generate(growth) : bmoe::RunResult{};
+        const bool rolled_back = session && failures == 1 && !failed && failed.error.find(stage) != std::string::npos &&
+                                 failed.error.find("previous sequence restored") != std::string::npos &&
+                                 old_kv == 512 && session->physical_kv_tokens() == old_kv &&
+                                 session->physical_kv_bytes() == old_bytes &&
+                                 session->gpu_expert_cache_bytes() == old_pool && session->kv_growth_count() == 0;
+        const auto ref_next = ref_first ? reference->generate(continuation) : bmoe::RunResult{};
+        const auto got_next = rolled_back ? session->generate(continuation) : bmoe::RunResult{};
+        if (!ref_first || !got_first || ref_first.generated_text != got_first.generated_text || !rolled_back ||
+            !ref_next || !got_next || ref_next.generated_text != got_next.generated_text) {
+            std::fprintf(stderr,
+                         "elastic KV rollback gate failed at %s: open=%s resize=%s next=%s, kv=%d/%d "
+                         "injections=%d equal=%d\n",
+                         stage, error.c_str(), failed.error.c_str(), got_next.error.c_str(), old_kv,
+                         session ? session->physical_kv_tokens() : 0, failures,
+                         ref_next.generated_text == got_next.generated_text);
+            return 1;
+        }
+    }
+    std::printf("elastic KV rollback passed: target restore and post-recreation failures, exact continuation\n");
+    return 0;
+}
+
 static int mtp_growth_gate(const char * model_path) {
     bmoe::RunConfig cfg;
     cfg.model_path = model_path;
@@ -194,7 +260,8 @@ static int rebalance_gate(const char * model_path, bool mtp, bool pressure_mode 
 
 int main(int argc, char ** argv) {
     if (argc != 2 && (argc != 3 || (std::string(argv[2]) != "mtp-real" && std::string(argv[2]) != "rebalance" &&
-                                    std::string(argv[2]) != "mtp-rebalance" && std::string(argv[2]) != "pressure")))
+                                    std::string(argv[2]) != "mtp-rebalance" && std::string(argv[2]) != "pressure" &&
+                                    std::string(argv[2]) != "rollback")))
         return 2;
     llama_backend_init();
     bool has_gpu = false;
@@ -206,8 +273,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 3) {
         const std::string mode = argv[2];
-        const int result = mode == "mtp-real" ? mtp_growth_gate(argv[1])
-                           : rebalance_gate(argv[1], mode == "mtp-rebalance", mode == "pressure");
+        const int result = mode == "mtp-real"   ? mtp_growth_gate(argv[1])
+                           : mode == "rollback" ? rollback_gate(argv[1])
+                                                : rebalance_gate(argv[1], mode == "mtp-rebalance", mode == "pressure");
         llama_backend_free();
         return result;
     }

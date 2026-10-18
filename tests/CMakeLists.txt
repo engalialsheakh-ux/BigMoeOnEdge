@@ -190,6 +190,8 @@ add_test(NAME gpu_agent_state_gate COMMAND bmoe_gpu_agent_state_gate ${_layer_ti
 set_tests_properties(gpu_agent_state_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu)
 add_test(NAME elastic_kv_gate COMMAND bmoe_elastic_kv_gate ${_layer_tile_model})
 set_tests_properties(elastic_kv_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu)
+add_test(NAME elastic_kv_rollback_gate COMMAND bmoe_elastic_kv_gate ${_layer_tile_model} rollback)
+set_tests_properties(elastic_kv_rollback_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu RESOURCE_LOCK gpu)
 add_test(NAME elastic_kv_rebalance_gate COMMAND bmoe_elastic_kv_gate ${_layer_tile_model} rebalance)
 set_tests_properties(elastic_kv_rebalance_gate PROPERTIES FIXTURES_REQUIRED TINY_QWEN35MOE SKIP_RETURN_CODE 77 LABELS gpu RESOURCE_LOCK gpu)
 

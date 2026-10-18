@@ -60,6 +60,8 @@ struct SessionConfig {
     // open() builds the wider verify batch, and — for the MTP source only — the draft context.
     // See RunConfig::spec.
     SpecConfig spec;
+    // Test hook: return true once to fail a named elastic-KV recreation step after state capture.
+    std::function<bool(const char *)> elastic_kv_fail_step;
     // Wide prefill graphs on an accelerator, decode on the CPU. Fixed for the session: the device
     // joins the scheduler at load. See RunConfig::prefill.
     PrefillDeviceConfig prefill;
